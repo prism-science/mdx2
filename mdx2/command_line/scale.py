@@ -13,7 +13,7 @@ from simple_parsing import field
 from mdx2.command_line import make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.io import loadobj, saveobj
-from mdx2.scaling import BatchModelRefiner, ScaledData
+from mdx2.scaling import BatchModelRefiner, ScaledData, RefinementMethod
 
 
 @dataclass
@@ -100,6 +100,7 @@ class Parameters:
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
     mca2020: bool = False
     """shortcut for --scaling.enable True --offset.enable True --detector.enable True --absorption.enable True"""
+    refinement_method: RefinementMethod = RefinementMethod.LEAST_SQUARES  # refinement method to use for model fitting
 
     def __post_init__(self):
         """Validate and process parameters after initialization"""
@@ -318,7 +319,7 @@ def run_scale(params):
 
     S = load_data_for_scaling(*params.hkl)
 
-    MR = BatchModelRefiner(S)
+    MR = BatchModelRefiner(S, method=params.refinement_method)
 
     if params.nproc != 1:
         logger.warning("Serial execution only, ignoring nproc value")
@@ -351,7 +352,7 @@ def run_scale(params):
         else:
             subsample = None
         S_pre = load_data_for_scaling(*params.hkl, subsample=subsample, merge_isotropic=params.prescale.isotropic)
-        MR_pre = BatchModelRefiner(S_pre)
+        MR_pre = BatchModelRefiner(S_pre, method=params.refinement_method)
         # transfer models to prescaling refiner
         for model_refiner, model_refiner_pre in zip(MR.batch_refiners, MR_pre.batch_refiners):
             model_refiner_pre.scaling.model = model_refiner.scaling.model

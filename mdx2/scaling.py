@@ -693,10 +693,20 @@ class ScaledData:
         return isoutlier.sum()
 
 
+# create an enum type for refinement method (e.g., least_squares, conjugate_gradient)
+from enum import Enum
+
+
+class RefinementMethod(Enum):
+    LEAST_SQUARES = 1
+    CONJUGATE_GRADIENT = 2
+
+
 class _ModelRefiner:
-    def __init__(self, data, model=None):
+    def __init__(self, data, model=None, method=RefinementMethod.LEAST_SQUARES):
         self.data = data
         self.model = model
+        self.method = method
         self._value = None  # cached value of the interpolated model at datapoints
 
     def calc_scale_offset(self, a=None, b=None, c=None, d=None):
@@ -735,6 +745,12 @@ class _ModelRefiner:
     def fit(self, Imerge, **kwargs):
         raise NotImplementedError
 
+    def calc_cg_problem(self, Imerge, **kwargs):
+        raise NotImplementedError
+
+    def cg_fit(self, Imerge, **kwargs):
+        raise NotImplementedError
+
     @property
     def value(self):
         if self._value is None:
@@ -742,7 +758,12 @@ class _ModelRefiner:
         return self._value
 
     def refine(self, Imerge, *args, **kwargs):
-        ufit, x2 = self.fit(Imerge, *args, **kwargs)
+        if self.method == RefinementMethod.LEAST_SQUARES:
+            ufit, x2 = self.fit(Imerge, *args, **kwargs)
+        elif self.method == RefinementMethod.CONJUGATE_GRADIENT:
+            ufit, x2 = self.cg_fit(Imerge, *args, **kwargs)
+        else:
+            raise ValueError(f"Unknown refinement method: {self.method}")
         self.model.set_u(ufit)
         self._value = None  # trigger re-calculation when requested
         return x2
@@ -783,6 +804,26 @@ class ScalingModelRefiner(_ModelRefiner):
         yy = np.sum(y**2)
         return AA, BB, Ay, yy
 
+    def calc_cg_problem(self, Imerge, a=None, c=None, d=None):
+        A0, B = self.model.interp_matrices(
+            self.data.phi.compressed(),
+        )
+
+        # compute predicted intensities a = b = d = 1, c = 0
+        tmp = self.data.copy()
+        tmp.scale, tmp.offset = self.calc_scale_offset()
+        Ipred = tmp.predict(Imerge).compressed()
+
+        # compute scaled intensities with b = 1
+        tmp.scale, tmp.offset = self.calc_scale_offset(a=a, c=c, d=d)
+        I = tmp.I.compressed()
+        sigma = tmp.sigma.compressed()
+
+        # compute fitting matrices
+        A = sparse.diags(Ipred / sigma) @ A0
+        y = I / sigma
+        return A, B, y
+
     def fit(self, Imerge, alpha_mult, a=None, c=None, d=None):
         AA, BB, Ay, yy = self.calc_problem(Imerge, a=a, c=c, d=d)
         alpha = alpha_mult * AA.trace() / BB.trace()
@@ -792,6 +833,20 @@ class ScalingModelRefiner(_ModelRefiner):
         else:
             ufit = np.linalg.lstsq(G, Ay, rcond=None)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
+        x2 = x2 / self.data.ih.count()
+        return ufit, x2
+
+    def cg_fit(self, Imerge, alpha_mult, a=None, c=None, d=None):
+        A, B, y = self.calc_cg_problem(Imerge, a=a, c=c, d=d)
+        A_norm = sparse.linalg.norm(A, ord="fro")
+        B_norm = sparse.linalg.norm(B, ord="fro")
+        alpha = alpha_mult * (A_norm / B_norm) ** 2
+        M = sparse.vstack([A, np.sqrt(alpha) * B])
+        z = np.zeros(shape=(B.shape[0],))
+        v = np.concatenate([y, z])
+        x0 = np.ones(shape=(M.shape[1],))
+        ufit = sparse.linalg.lsmr(M, v, x0=x0, atol=1e-6, btol=1e-6)[0]
+        x2 = np.linalg.norm(A @ ufit - y) ** 2
         x2 = x2 / self.data.ih.count()
         return ufit, x2
 
@@ -836,6 +891,29 @@ class AbsorptionModelRefiner(_ModelRefiner):
 
         return AA, BBxy, BBz, Ay, yy
 
+    def calc_cg_problem(self, Imerge, b=None, c=None, d=None):
+        A0, Bxy, Bz = self.model.interp_matrices(
+            self.data.ix.compressed(),
+            self.data.iy.compressed(),
+            self.data.phi.compressed(),
+        )
+
+        # compute predicted intensities a = 1
+        tmp = self.data.copy()
+        tmp.scale, tmp.offset = self.calc_scale_offset(b=b, c=c, d=d)
+        Ipred = tmp.predict(Imerge).compressed()
+
+        # compute scaled intensities with a = b = d = 1, c = 0
+        tmp.scale, tmp.offset = self.calc_scale_offset()
+        I = tmp.I.compressed()
+        sigma = tmp.sigma.compressed()
+
+        # compute fitting matrices
+        A = sparse.diags(Ipred / sigma) @ A0
+        y = I / sigma
+
+        return A, Bxy, Bz, y
+
     def fit(self, Imerge, alpha_xy_mult, alpha_z_mult, b=None, c=None, d=None):
         AA, BBxy, BBz, Ay, yy = self.calc_problem(Imerge, b=b, c=c, d=d)
         alpha_xy = alpha_xy_mult * AA.trace() / BBxy.trace()
@@ -848,6 +926,22 @@ class AbsorptionModelRefiner(_ModelRefiner):
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
         x2 = x2 / self.data.ih.count()
         self.model.set_u(ufit)
+        return ufit, x2
+
+    def cg_fit(self, Imerge, alpha_xy_mult, alpha_z_mult, b=None, c=None, d=None):
+        A, Bxy, Bz, y = self.calc_cg_problem(Imerge, b=b, c=c, d=d)
+        A_norm = sparse.linalg.norm(A, ord="fro")
+        Bz_norm = sparse.linalg.norm(Bz, ord="fro")
+        Bxy_norm = sparse.linalg.norm(Bxy, ord="fro")
+        alpha_xy = alpha_xy_mult * (A_norm / Bxy_norm) ** 2
+        alpha_z = alpha_z_mult * (A_norm / Bz_norm) ** 2
+        M = sparse.vstack([A, np.sqrt(alpha_xy) * Bxy, np.sqrt(alpha_z) * Bz])
+        z = np.zeros(shape=(Bxy.shape[0] + Bz.shape[0],))
+        v = np.concatenate([y, z])
+        x0 = np.ones(shape=(M.shape[1],))
+        ufit = sparse.linalg.lsmr(M, v, x0=x0, atol=1e-6, btol=1e-6)[0]
+        x2 = np.linalg.norm(A @ ufit - y) ** 2
+        x2 = x2 / self.data.ih.count()
         return ufit, x2
 
 
@@ -890,6 +984,28 @@ class OffsetModelRefiner(_ModelRefiner):
         H = sparse.eye(A.shape[1])
         return AA, BBx, BBy, H, Ay, yy
 
+    def calc_cg_problem(self, Imerge, a=None, b=None, d=None):
+        A0, Bx, By = self.model.interp_matrices(
+            self.data.s.compressed(),
+            self.data.phi.compressed(),
+        )
+
+        # compute predicted intensities a = 1, c = 0
+        tmp = self.data.copy()
+        tmp.scale, tmp.offset = self.calc_scale_offset(b=b)
+        Ipred = tmp.predict(Imerge).compressed()
+
+        # compute scaled intensities with b = 1 and c = 0
+        tmp.scale, tmp.offset = self.calc_scale_offset(a=a, d=d)
+        I = tmp.I.compressed()
+        sigma = tmp.sigma.compressed()
+
+        # compute fitting matrices
+        A = sparse.diags(1 / sigma) @ A0
+        y = (I - Ipred) / sigma
+        H = sparse.eye(A.shape[1])
+        return A, Bx, By, H, y
+
     def fit(self, Imerge, alpha_x_mult, alpha_y_mult, alpha_c_mult, min_c, a=None, b=None, d=None):
         AA, BBx, BBy, H, Ay, yy = self.calc_problem(Imerge, a=a, b=b, d=d)
         alpha_x = alpha_x_mult * AA.trace() / BBx.trace()
@@ -907,6 +1023,27 @@ class OffsetModelRefiner(_ModelRefiner):
             ufit[ufit < min_c] = min_c  # apply threshold
             ufit += min_c - np.min(ufit)  # level shift
 
+        return ufit, x2
+
+    def cg_fit(self, Imerge, alpha_x_mult, alpha_y_mult, alpha_c_mult, min_c, a=None, b=None, d=None):
+        A, Bx, By, H, y = self.calc_cg_problem(Imerge, a=a, b=b, d=d)
+        A_norm = sparse.linalg.norm(A, ord="fro")
+        Bx_norm = sparse.linalg.norm(Bx, ord="fro")
+        By_norm = sparse.linalg.norm(By, ord="fro")
+        A_max_diag = A.power(2).sum(axis=0).max()
+        H_max_diag = 1.0  # H is identity matrix
+        alpha_x = alpha_x_mult * (A_norm / Bx_norm) ** 2
+        alpha_y = alpha_y_mult * (A_norm / By_norm) ** 2
+        alpha_c = alpha_c_mult * (A_max_diag / H_max_diag)
+        M = sparse.vstack([A, np.sqrt(alpha_x) * Bx, np.sqrt(alpha_y) * By, np.sqrt(alpha_c) * H])
+        z = np.zeros(shape=(Bx.shape[0] + By.shape[0] + H.shape[0],))
+        v = np.concatenate([y, z])
+        ufit = sparse.linalg.lsmr(M, v, atol=1e-6, btol=1e-6)[0]
+        x2 = np.linalg.norm(A @ ufit - y) ** 2
+        x2 = x2 / self.data.ih.count()
+        if min_c is not None:
+            ufit[ufit < min_c] = min_c  # apply threshold
+            ufit += min_c - np.min(ufit)  # level shift
         return ufit, x2
 
 
@@ -947,6 +1084,28 @@ class DetectorModelRefiner(_ModelRefiner):
 
         return AA, BB, Ay, yy
 
+    def calc_cg_problem(self, Imerge, a=None, b=None, c=None):
+        A0, B = self.model.interp_matrices(
+            self.data.ix.compressed(),
+            self.data.iy.compressed(),
+        )
+
+        # compute predicted intensities d = 1
+        tmp = self.data.copy()
+        tmp.scale, tmp.offset = self.calc_scale_offset(a=a, b=b, c=c)
+        Ipred = tmp.predict(Imerge).compressed()
+
+        # compute scaled intensities with a = b = d = 1, c = 0
+        tmp.scale, tmp.offset = self.calc_scale_offset()
+        I = tmp.I.compressed()
+        sigma = tmp.sigma.compressed()
+
+        # compute fitting matrices
+        A = sparse.diags(Ipred / sigma) @ A0
+        y = I / sigma
+
+        return A, B, y
+
     def fit(self, Imerge, alpha_mult, a=None, b=None, c=None):
         AA, BB, Ay, yy = self.calc_problem(Imerge, a=a, b=b, c=c)
         alpha = alpha_mult * AA.trace() / BB.trace()
@@ -959,14 +1118,36 @@ class DetectorModelRefiner(_ModelRefiner):
         x2 = x2 / self.data.ih.count()
         return ufit, x2
 
+    def cg_fit(self, Imerge, alpha_mult, a=None, b=None, c=None):
+        A, B, y = self.calc_cg_problem(Imerge, a=a, b=b, c=c)
+        A_norm = sparse.linalg.norm(A, ord="fro")
+        B_norm = sparse.linalg.norm(B, ord="fro")
+        alpha = alpha_mult * (A_norm / B_norm) ** 2
+        M = sparse.vstack([A, np.sqrt(alpha) * B])
+        z = np.zeros(shape=(B.shape[0],))
+        v = np.concatenate([y, z])
+        x0 = np.ones(shape=(M.shape[1],))
+        ufit = sparse.linalg.lsmr(M, v, x0=x0, atol=1e-6, btol=1e-6)[0]
+        x2 = np.linalg.norm(A @ ufit - y) ** 2
+        x2 = x2 / self.data.ih.count()
+        return ufit, x2
+
 
 class CombinedModelRefiner:
-    def __init__(self, data, scaling_model=None, absorption_model=None, offset_model=None, detector_model=None):
+    def __init__(
+        self,
+        data,
+        scaling_model=None,
+        absorption_model=None,
+        offset_model=None,
+        detector_model=None,
+        method=RefinementMethod.LEAST_SQUARES,
+    ):
         self.data = data
-        self.scaling = ScalingModelRefiner(data, scaling_model)
-        self.absorption = AbsorptionModelRefiner(data, absorption_model)
-        self.offset = OffsetModelRefiner(data, offset_model)
-        self.detector = DetectorModelRefiner(data, detector_model)
+        self.scaling = ScalingModelRefiner(data, scaling_model, method=method)
+        self.absorption = AbsorptionModelRefiner(data, absorption_model, method=method)
+        self.offset = OffsetModelRefiner(data, offset_model, method=method)
+        self.detector = DetectorModelRefiner(data, detector_model, method=method)
 
     @property
     def a(self):
@@ -1013,7 +1194,15 @@ class CombinedModelRefiner:
 
 
 class BatchModelRefiner:
-    def __init__(self, data, scaling_models=None, absorption_models=None, offset_models=None, detector_model=None):
+    def __init__(
+        self,
+        data,
+        scaling_models=None,
+        absorption_models=None,
+        offset_models=None,
+        detector_model=None,
+        method=RefinementMethod.LEAST_SQUARES,
+    ):
         self.data = data
         self._batch_refiners = []
 
@@ -1025,9 +1214,9 @@ class BatchModelRefiner:
             offset_models = [None] * self.data.nbatches
 
         for ds, sm, am, om in zip(self.data.batches(), scaling_models, absorption_models, offset_models):
-            self._batch_refiners.append(CombinedModelRefiner(ds, sm, am, om, detector_model))
+            self._batch_refiners.append(CombinedModelRefiner(ds, sm, am, om, detector_model, method=method))
 
-        self.detector = DetectorModelRefiner(data, detector_model)
+        self.detector = DetectorModelRefiner(data, detector_model, method=method)
 
     @property
     def batch_refiners(self):
@@ -1053,7 +1242,7 @@ class BatchModelRefiner:
         [br.absorption.add_model(*args, **kwargs) for br in self._batch_refiners]
 
     def add_detector_model(self, *args, **kwargs):
-        tmp = DetectorModelRefiner(self.data)
+        tmp = DetectorModelRefiner(self.data, method=self.detector.method)
         tmp.add_model(*args, **kwargs)
         self.detector = tmp
         for br in self._batch_refiners:
