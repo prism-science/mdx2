@@ -1057,7 +1057,8 @@ class OffsetModelRefiner(_ModelRefiner):
         # alpha_c = alpha_c_mult*AA.trace()/H.trace()
         alpha_c = alpha_c_mult * np.max(AA.diagonal()) / np.max(H.diagonal())
         G = AA + alpha_x * BBx + alpha_y * BBy + alpha_c * H
-        ufit = sparse.linalg.minres(G, Ay)[0]
+        x0 = np.zeros(shape=(G.shape[1],))
+        ufit = sparse.linalg.minres(G, Ay, x0=x0)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
         x2 = x2 / self.data.ih.count()
         if min_c is not None:
