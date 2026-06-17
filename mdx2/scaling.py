@@ -700,6 +700,7 @@ from enum import Enum
 class RefinementMethod(Enum):
     LEAST_SQUARES = 1
     CONJUGATE_GRADIENT = 2
+    MINRES = 3
 
 
 class _ModelRefiner:
@@ -762,6 +763,8 @@ class _ModelRefiner:
             ufit, x2 = self.fit(Imerge, *args, **kwargs)
         elif self.method == RefinementMethod.CONJUGATE_GRADIENT:
             ufit, x2 = self.cg_fit(Imerge, *args, **kwargs)
+        elif self.method == RefinementMethod.MINRES:
+            ufit, x2 = self.minres_fit(Imerge, *args, **kwargs)
         else:
             raise ValueError(f"Unknown refinement method: {self.method}")
         self.model.set_u(ufit)
@@ -832,6 +835,16 @@ class ScalingModelRefiner(_ModelRefiner):
             ufit = sparse.linalg.lsqr(G, Ay)[0]
         else:
             ufit = np.linalg.lstsq(G, Ay, rcond=None)[0]
+        x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
+        x2 = x2 / self.data.ih.count()
+        return ufit, x2
+
+    def minres_fit(self, Imerge, alpha_mult, a=None, c=None, d=None):
+        AA, BB, Ay, yy = self.calc_problem(Imerge, a=a, c=c, d=d)
+        alpha = alpha_mult * AA.trace() / BB.trace()
+        G = AA + alpha * BB
+        x0 = np.ones(shape=(G.shape[1],))
+        ufit = sparse.linalg.minres(G, Ay, x0=x0)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
         x2 = x2 / self.data.ih.count()
         return ufit, x2
@@ -925,7 +938,19 @@ class AbsorptionModelRefiner(_ModelRefiner):
             ufit = np.linalg.lstsq(G, Ay, rcond=None)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
         x2 = x2 / self.data.ih.count()
-        self.model.set_u(ufit)
+        self.model.set_u(ufit)  # <-- is this necessary? the other fit functions dont use it.
+        return ufit, x2
+
+    def minres_fit(self, Imerge, alpha_xy_mult, alpha_z_mult, b=None, c=None, d=None):
+        AA, BBxy, BBz, Ay, yy = self.calc_problem(Imerge, b=b, c=c, d=d)
+        alpha_xy = alpha_xy_mult * AA.trace() / BBxy.trace()
+        alpha_z = alpha_z_mult * AA.trace() / BBz.trace()
+        G = AA + alpha_xy * BBxy + alpha_z * BBz
+        x0 = np.ones(shape=(G.shape[1],))
+        ufit = sparse.linalg.minres(G, Ay, x0=x0)[0]
+        x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
+        x2 = x2 / self.data.ih.count()
+        self.model.set_u(ufit)  # <-- is this necessary? the other fit functions dont use it.
         return ufit, x2
 
     def cg_fit(self, Imerge, alpha_xy_mult, alpha_z_mult, b=None, c=None, d=None):
@@ -1025,6 +1050,22 @@ class OffsetModelRefiner(_ModelRefiner):
 
         return ufit, x2
 
+    def minres_fit(self, Imerge, alpha_x_mult, alpha_y_mult, alpha_c_mult, min_c, a=None, b=None, d=None):
+        AA, BBx, BBy, H, Ay, yy = self.calc_problem(Imerge, a=a, b=b, d=d)
+        alpha_x = alpha_x_mult * AA.trace() / BBx.trace()
+        alpha_y = alpha_y_mult * AA.trace() / BBy.trace()
+        # alpha_c = alpha_c_mult*AA.trace()/H.trace()
+        alpha_c = alpha_c_mult * np.max(AA.diagonal()) / np.max(H.diagonal())
+        G = AA + alpha_x * BBx + alpha_y * BBy + alpha_c * H
+        ufit = sparse.linalg.minres(G, Ay)[0]
+        x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
+        x2 = x2 / self.data.ih.count()
+        if min_c is not None:
+            ufit[ufit < min_c] = min_c  # apply threshold
+            ufit += min_c - np.min(ufit)  # level shift
+
+        return ufit, x2
+
     def cg_fit(self, Imerge, alpha_x_mult, alpha_y_mult, alpha_c_mult, min_c, a=None, b=None, d=None):
         A, Bx, By, H, y = self.calc_cg_problem(Imerge, a=a, b=b, d=d)
         A_norm = sparse.linalg.norm(A, ord="fro")
@@ -1114,6 +1155,16 @@ class DetectorModelRefiner(_ModelRefiner):
             ufit = sparse.linalg.lsqr(G, Ay)[0]
         else:
             ufit = np.linalg.lstsq(G, rcond=None)[0]
+        x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
+        x2 = x2 / self.data.ih.count()
+        return ufit, x2
+
+    def minres_fit(self, Imerge, alpha_mult, a=None, b=None, c=None):
+        AA, BB, Ay, yy = self.calc_problem(Imerge, a=a, b=b, c=c)
+        alpha = alpha_mult * AA.trace() / BB.trace()
+        G = AA + alpha * BB
+        x0 = np.ones(shape=(G.shape[1],))
+        ufit = sparse.linalg.minres(G, Ay, x0=x0)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
         x2 = x2 / self.data.ih.count()
         return ufit, x2
