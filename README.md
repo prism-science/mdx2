@@ -64,14 +64,14 @@ mamba install jupyterlab dials xia2 nexpy
 
 ## Contributing
 
-Mdx2 is being developed in collaboration with [The Diffuse Project](https://diffuse.science), and the `dev` branch in the org's fork contains the latest changes: [diff-use/mdx2/tree/dev](https://github.com/diff-use/mdx2/tree/dev).
+Mdx2 is being developed in collaboration with [The Diffuse Project](https://diffuse.science), and the `dev` branch in the org's fork contains the latest changes: [prism-science/mdx2/tree/dev](https://github.com/prism-science/mdx2/tree/dev).
 
 Contributions can be made by branching from `dev`, and submitting PRs to that branch. When it is time for a new release, the `dev` branch is merged upstream to the `ando-lab/mdx2` repo.
 
-### Developer install (conda + pip from dev branch of diff-use fork)
+### Developer install (conda + pip from dev branch of prism-science fork)
 
 ```bash
-git clone -b dev https://github.com/diff-use/mdx2.git
+git clone -b dev https://github.com/prism-science/mdx2.git
 cd mdx2
 mamba create -f env.yaml -n mdx2-dev
 mamba activate mdx2-dev
