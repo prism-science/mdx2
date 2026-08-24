@@ -21,7 +21,7 @@ Install [micromamba](https://mamba.readthedocs.io/en/latest/installation/microma
 The following will create the `conda` environment with the minimal dependencies for `mdx2`:
 
 ```bash
-micromamba create -f https://raw.githubusercontent.com/diff-use/mdx2/main/env.yaml
+micromamba create -f https://raw.githubusercontent.com/prism-science/mdx2/main/env.yaml
 ```
 
 Answer yes (`Y`) when prompted.
@@ -31,7 +31,7 @@ Next, activate the environment and install `dials`, `nexpy`, `jupyter lab`, and 
 ```bash
 micromamba activate mdx2
 micromamba install -c conda-forge dials nexpy jupyterlab
-pip install git+https://github.com/diff-use/mdx2
+pip install git+https://github.com/prism-science/mdx2
 ```
 
 Answer yes (`Y`) when prompted.
