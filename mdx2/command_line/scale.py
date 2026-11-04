@@ -307,22 +307,23 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False, eng
     else:
         logger.info("Grouping redundant observations...")
         with P.step("group"):
-            _, index_map, _ = hkl.unique()
+            index_map = _group_index(hkl)
 
     if engine == "fast":
         from mdx2.fast_scaling import FastScaledData as data_class  # noqa: PLC0415 (numba is optional)
     else:
         data_class = ScaledData
-    S = data_class(
-        hkl.intensity,
-        hkl.intensity_error,
-        index_map,
-        phi=hkl.phi,
-        s=hkl.s,
-        ix=hkl.ix,
-        iy=hkl.iy,
-        batch=hkl.batch,
-    )
+    with P.step("init_data"):
+        S = data_class(
+            hkl.intensity,
+            hkl.intensity_error,
+            index_map,
+            phi=hkl.phi,
+            s=hkl.s,
+            ix=hkl.ix,
+            iy=hkl.iy,
+            batch=hkl.batch,
+        )
 
     with P.step("mask_singletons"):
         nsingletons = S.mask_singletons()
@@ -457,6 +458,24 @@ def run_scale(params):
     P.summary()
 
     logger.info("Scaling completed successfully")
+
+
+def _group_index(hkl, max_table_ratio=4):
+    """Group index of each observation: the same as HKLTable.unique()'s index_map (groups numbered in order of the
+    packed (H, K, L) key), computed in linear time with a table over the key range when that range is at most
+    max_table_ratio x the number of observations (table memory ~9 bytes per possible key); otherwise np.unique."""
+    ind, _ = hkl.to_array_index()
+    sz = [int(np.max(j)) + 1 for j in ind]
+    key = np.ravel_multi_index(ind, sz)
+    n_keys = int(np.prod(sz, dtype=np.int64))
+    if n_keys <= max_table_ratio * key.size:
+        present = np.zeros(n_keys, dtype=bool)
+        present[key] = True
+        group_of_key = np.cumsum(present, dtype=np.int64) - 1
+        logger.info("Grouping with a key table ({} possible keys, {} groups)", n_keys, int(group_of_key[-1]) + 1)
+        return group_of_key[key]
+    logger.info("Grouping by sorting ({} possible keys > {} x {} observations)", n_keys, max_table_ratio, key.size)
+    return np.unique(key, return_inverse=True)[1].ravel()
 
 
 def _set_threads(nproc):

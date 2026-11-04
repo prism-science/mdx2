@@ -198,6 +198,24 @@ def k_normal(kind, nd, x0, x1, x2, lo, hi, w0, dw, N, tab, r0, r1, mask, I, sigm
     return out, aty, yy[:, 0].sum(), cnt[:, 0].sum()
 
 
+@nb.njit(cache=True)
+def k_group_order(ih, G):
+    """Observations ordered by group (stable counting sort, linear time) and each group's start in that order.
+    Serial: runs before mdx2.scale starts numba's threads."""
+    gstart = np.zeros(G + 1, np.int64)
+    for i in range(ih.size):
+        gstart[ih[i] + 1] += 1
+    for h in range(G):
+        gstart[h + 1] += gstart[h]
+    pos = gstart[:-1].copy()
+    order = np.empty(ih.size, np.int64)
+    for i in range(ih.size):
+        g = ih[i]
+        order[pos[g]] = i
+        pos[g] += 1
+    return order, gstart
+
+
 @nb.njit(parallel=True, cache=True, error_model="numpy")
 def k_apply(va, vb, vc, vd, scale, offset, nchunk):
     """mdx2 apply: scale = a b d, offset = c / b (numpy semantics for b = 0)."""
@@ -331,9 +349,7 @@ class FastScaledData:
             mask = np.isnan(self._I) | np.isnan(sg) | (sg == 0) | np.isinf(sg)
         self.mask = np.ascontiguousarray(mask, dtype=np.bool_)
         self._ihmax = int(self._ih.max())
-        G = self._ihmax + 1
-        self._order = np.argsort(self._ih, kind="stable")
-        self._gstart = np.searchsorted(self._ih[self._order], np.arange(G + 1)).astype(np.int64)
+        self._order, self._gstart = k_group_order(self._ih, self._ihmax + 1)
 
     @property
     def nchunk(self):
