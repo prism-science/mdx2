@@ -13,7 +13,7 @@ from simple_parsing import field  # pip install simple-parsing
 from mdx2.command_line import make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.io import loadobj, saveobj
-from mdx2.scaling import BatchModelRefiner, ScaledData
+from mdx2.scaling_reference import BatchModelRefiner, ScaledData
 
 
 @dataclass

@@ -13,6 +13,19 @@ New here? Have a look at our recent [Blog post](https://prismscience.org/researc
 
 ## Versions
 
+### Next version (unreleased, in `dev`)
+
+Faster `mdx2.scale`: the same alternating-least-squares algorithm, with compiled multi-threaded passes over the data.
+
+- `mdx2.scale` is 20-30x faster on large datasets and needs about half the memory. Two Eiger 16M sweeps (112M observations, `--mca2020`): 30 min, 40 GB -> 1 min, 17 GB on a 64-core node. Results match the previous version (chi2 at every refinement step; a few borderline outliers can differ).
+- `--nproc` sets the number of threads; the default (-1) uses all CPUs available to the process (respecting the affinity mask and container CPU quotas).
+- `--engine reference` runs the previous implementation (single-threaded; kept for one release).
+- `--profile` logs wall time and memory per step; `--profile_file` writes them as JSON lines.
+- Removed: pre-scaling (`--prescale.*`).
+- Faster grouping of symmetry-equivalent observations (`HKLTable.unique`), used by `mdx2.scale`.
+- Scale files are unchanged, so downstream steps (`mdx2.merge`, `mdx2.reintegrate`, reports) work as before.
+- New dependencies: `numba`, `threadpoolctl`, `psutil`.
+
 ### Version 1.0.5
 
 A minor update to prepare the CLI for pipeline integration. Previous versions had to be invoked from the working directory. This version allows arbitrary directories to be set for all input and output files.
@@ -61,6 +74,15 @@ Recommended: add packages for Bragg processing, jupyter notebooks, and nexus vis
 ```bash
 mamba install jupyterlab dials xia2 nexpy
 ```
+
+## Performance notes
+
+`mdx2.scale` runs its passes over the data on multiple threads (numba). Typical memory: about 150 bytes per observation (17 GB for 112M observations).
+
+- Threads: `--nproc N` (default: all available CPUs). On shared machines, choose fewer.
+- Threading layer: mdx2 uses numba's `workqueue` layer. Set `NUMBA_THREADING_LAYER` to override; numba's OpenMP layer gave wrong results on some multi-core Linux nodes, and mdx2 stops with an error if a parallel pass miscounts observations.
+- Transparent huge pages: on Linux machines where huge pages are allocated with direct compaction (`/sys/kernel/mm/transparent_hugepage/defrag` set to `madvise`) and most memory is page cache, large numpy allocations can stall. If loading and grouping are unexpectedly slow (see `--profile`), try `NUMPY_MADVISE_HUGEPAGE=0`; on one shared node this made the run 2x faster. Where plenty of memory is free, huge pages help, so leave it on.
+- To check a new machine: `pytest tests/test_scaling_engines.py`, and on real data `MDX2_TEST_HKL=corrected.nxs pytest -s tests/test_scaling_real_data.py`.
 
 ## Contributing
 

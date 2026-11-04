@@ -1,15 +1,15 @@
-"""The fast scaling engine must reproduce the default engine (same algorithm) on synthetic data.
+"""mdx2.scaling (compiled, multi-threaded) must reproduce mdx2.scaling_reference (same algorithm) on synthetic data.
 
-Quick (seconds); run it on a new machine / numba version before a large job:  pytest tests/test_fast_scaling.py
+Quick (seconds); run it on a new machine or numba version before a large job:  pytest tests/test_scaling_engines.py
 """
 
+import numba
 import numpy as np
 import pytest
 
-numba = pytest.importorskip("numba")
-
-from mdx2.fast_scaling import FastBatchModelRefiner, FastScaledData  # noqa: E402
-from mdx2.scaling import BatchModelRefiner, ScaledData  # noqa: E402
+from mdx2.scaling import BatchModelRefiner, ScaledData
+from mdx2.scaling_reference import BatchModelRefiner as RefBatchModelRefiner
+from mdx2.scaling_reference import ScaledData as RefScaledData
 
 
 def synthetic(n_groups=3000, mult=8, seed=0):
@@ -57,14 +57,14 @@ def step(MR, kind):
 
 
 @pytest.mark.parametrize("nthreads", [1, None])
-def test_fast_engine_matches_default(nthreads):
+def test_scaling_matches_reference(nthreads):
     if nthreads is not None:
         numba.set_num_threads(nthreads)
     else:
         numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
     D = synthetic()
-    ref = build(ScaledData, BatchModelRefiner, D)
-    fast = build(FastScaledData, FastBatchModelRefiner, D)
+    ref = build(RefScaledData, RefBatchModelRefiner, D)
+    fast = build(ScaledData, BatchModelRefiner, D)
     for kind in ("b", "c", "b", "c", "d", "a", "d", "a"):
         x2_ref, x2_fast = step(ref, kind), step(fast, kind)
         assert x2_fast >= 0

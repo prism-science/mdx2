@@ -14,20 +14,6 @@ from mdx2 import profiling
 from mdx2.command_line import make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.io import loadobj, saveobj
-from mdx2.scaling import BatchModelRefiner, ScaledData
-
-
-@dataclass
-class PrescaleParameters:
-    """Options for initial quick refinement of models to a subset of data and/or isotropically averaged data"""
-
-    enable: bool = False  # include pre-scaling refinement
-    subsample: int = 10  # subsample factor for pre-scaling refinement
-    isotropic: bool = True  # use isotropically averaged data for pre-scaling refinement
-    scaling: bool = True  # include scaling model in pre-scaling refinement if scaling.enable is True
-    offset: bool = False  # include offset model in pre-scaling refinement if offset.enable is True
-    detector: bool = False  # include detector model in pre-scaling refinement if detector.enable is True
-    absorption: bool = True  # include absorption model in pre-scaling refinement if absorption.enable is True
 
 
 @dataclass
@@ -91,7 +77,6 @@ class Parameters:
     """Options for refining a scaling model to unmerged corrected intensities"""
 
     hkl: List[str] = field(positional=True, nargs="+")  # NeXus file(s) containing hkl_table
-    prescale: PrescaleParameters = field(default_factory=PrescaleParameters)
     scaling: ScalingModelParameters = field(default_factory=ScalingModelParameters)
     absorption: AbsorptionModelParameters = field(default_factory=AbsorptionModelParameters)
     detector: DetectorModelParameters = field(default_factory=DetectorModelParameters)
@@ -99,10 +84,12 @@ class Parameters:
     outfile: Optional[List[str]] = field(default=None, nargs="*")
     """name of the output NeXus file(s). If omitted, will attempt a sensible name such as scales.nxs"""
     logfile: str = "mdx2.scale.log"  # name of the log file
-    nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
-    engine: str = "default"
-    """scaling engine: "default" (mdx2.scaling) or "fast" (same algorithm, compiled multi-threaded passes over the
-    data; needs numba; threads from --nproc). Prescaling is not supported by the fast engine."""
+    nproc: int = -1
+    """threads: -1 = all available CPUs (respecting the affinity mask and container CPU quota), N = N threads,
+    -N = all available CPUs but N-1 (the reference engine is single-threaded)"""
+    engine: str = "fast"
+    """scaling engine: "fast" (default; compiled multi-threaded mdx2.scaling) or "reference" (the slower
+    implementation of mdx2 <= 1.0.5, mdx2.scaling_reference; same algorithm, kept for one release)"""
     profile: bool = False  # log a summary of wall time and memory per step (load, apply, merge, fit, ...)
     profile_file: Optional[str] = None  # write wall time and memory per step to this file (JSON lines)
     mca2020: bool = False
@@ -120,10 +107,8 @@ class Parameters:
         # Check for duplicate input files
         # Note: Same filename in different directories is valid (e.g., /path1/data.nxs, /path2/data.nxs)
         # But truly duplicate paths are not allowed (e.g., data.nxs, data.nxs)
-        if self.engine not in ("default", "fast"):
-            raise ValueError(f"Unknown engine {self.engine!r} (use 'default' or 'fast')")
-        if self.engine == "fast" and self.prescale.enable:
-            raise ValueError("--prescale.enable is not supported with --engine fast")
+        if self.engine not in ("fast", "reference"):
+            raise ValueError(f"Unknown engine {self.engine!r} (use 'fast' or 'reference')")
         if len(self.hkl) != len(set(self.hkl)):
             raise ValueError("Duplicate input files are not allowed")
 
@@ -283,15 +268,13 @@ def refine_absorption_model(MR, absorption_params):
         old_x2 = x2
 
 
-def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False, engine="default"):
-    """Load data from hkl files into a single HKLTable"""
+def load_data_for_scaling(*hkl_files, engine="fast"):
+    """Load hkl tables (one batch per file), group symmetry-equivalent observations, mask singletons."""
     P = profiling.PROFILER
     tabs = []
     for n, fn in enumerate(hkl_files):
         with P.step("load", file=fn):
             tmp = loadobj(fn, "hkl_table")
-        if subsample is not None:
-            tmp = tmp[::subsample]
         tmp.batch = n * np.ones_like(tmp.op)
         tabs.append(tmp)
 
@@ -300,22 +283,16 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False, eng
 
     logger.info("Loaded {} reflections from {} file(s)", len(hkl), len(hkl_files))
 
-    if merge_isotropic:
-        # TODO: should bin width be a parameter?
-        # (here we use 0.001 as a default bin width)
-        logger.info("Grouping by scattering vector length (isotropic averaging)...")
-        index_map = np.floor(hkl.s * 1000).astype(np.uint16)
-    else:
-        logger.info("Grouping redundant observations...")
-        with P.step("group"):
-            index_map = _group_index(hkl)
+    logger.info("Grouping redundant observations...")
+    with P.step("group"):
+        _, index_map, _ = hkl.unique()
 
-    if engine == "fast":
-        from mdx2.fast_scaling import FastScaledData as data_class  # noqa: PLC0415 (numba is optional)
+    if engine == "reference":
+        from mdx2.scaling_reference import ScaledData  # noqa: PLC0415 (only for the reference engine)
     else:
-        data_class = ScaledData
+        from mdx2.scaling import ScaledData  # noqa: PLC0415 (imports numba)
     with P.step("init_data"):
-        S = data_class(
+        S = ScaledData(
             hkl.intensity,
             hkl.intensity_error,
             index_map,
@@ -341,16 +318,16 @@ def run_scale(params):
 
     S = load_data_for_scaling(*params.hkl, engine=params.engine)
 
-    if params.engine == "fast":
-        # threads start after loading and grouping (plain numpy), just before the first kernel
-        _set_threads(params.nproc)
-        from mdx2.fast_scaling import FastBatchModelRefiner  # noqa: PLC0415 (numba is optional)
+    if params.engine == "reference":
+        from mdx2.scaling_reference import BatchModelRefiner  # noqa: PLC0415
 
-        MR = FastBatchModelRefiner(S)
+        logger.info("Reference engine (single-threaded)")
     else:
-        MR = BatchModelRefiner(S)
-        if params.nproc != 1:
-            logger.warning("Serial execution only, ignoring nproc value")
+        from mdx2.parallel import set_threads  # noqa: PLC0415
+        from mdx2.scaling import BatchModelRefiner  # noqa: PLC0415
+
+        set_threads(params.nproc)  # threads start after loading and grouping (plain numpy), before the first kernel
+    MR = BatchModelRefiner(S)
     _instrument(MR, P)
 
     if params.scaling.enable:
@@ -373,50 +350,6 @@ def run_scale(params):
             nix=params.detector.nx,
             niy=params.detector.ny,
         )
-
-    # prescaling phase
-    if params.prescale.enable:
-        if params.prescale.subsample > 1:
-            subsample = params.prescale.subsample
-        else:
-            subsample = None
-        S_pre = load_data_for_scaling(*params.hkl, subsample=subsample, merge_isotropic=params.prescale.isotropic)
-        MR_pre = BatchModelRefiner(S_pre)
-        _instrument(MR_pre, P)
-        # transfer models to prescaling refiner
-        for model_refiner, model_refiner_pre in zip(MR.batch_refiners, MR_pre.batch_refiners):
-            model_refiner_pre.scaling.model = model_refiner.scaling.model
-            model_refiner_pre.offset.model = model_refiner.offset.model
-            model_refiner_pre.detector.model = model_refiner.detector.model
-            model_refiner_pre.absorption.model = model_refiner.absorption.model
-        # refine models on prescaling data
-        logger.info("Starting prescaling refinement...")
-        if params.prescale.scaling and params.scaling.enable:
-            logger.info("Optimizing scale vs. phi (b)...")
-            P.stage = "pre b"
-            refine_scaling_model(MR_pre, params.scaling)
-            mask_outliers(MR_pre, params.scaling.outlier)
-        if params.prescale.offset and params.prescale.scaling and params.offset.enable and params.scaling.enable:
-            logger.info("Optimizing scaling and offset models together (b,c)...")
-            P.stage = "pre b,c"
-            refine_scaling_and_offset_model(MR_pre, params.scaling, params.offset)
-            mask_outliers(MR_pre, params.offset.outlier)
-        if params.prescale.offset and params.offset.enable:
-            logger.info("Optimizing offset vs. phi and resolution (c)...")
-            P.stage = "pre c"
-            refine_offset_model(MR_pre, params.offset)
-            mask_outliers(MR_pre, params.offset.outlier)
-        if params.prescale.detector and params.detector.enable:
-            logger.info("Optimizing scale vs. detector position (d)...")
-            P.stage = "pre d"
-            refine_detector_model(MR_pre, params.detector)
-            mask_outliers(MR_pre, params.detector.outlier)
-        if params.prescale.absorption and params.absorption.enable:
-            logger.info("Optimizing scale vs. detector position and phi (a)...")
-            P.stage = "pre a"
-            refine_absorption_model(MR_pre, params.absorption)
-            mask_outliers(MR_pre, params.absorption.outlier)
-        logger.info("Prescaling refinement completed")
 
     logger.info("Starting main scaling refinement...")
 
@@ -459,47 +392,6 @@ def run_scale(params):
     P.summary()
 
     logger.info("Scaling completed successfully")
-
-
-def _group_index(hkl, max_table_ratio=4):
-    """Group index of each observation: the same as HKLTable.unique()'s index_map (groups numbered in order of the
-    packed (H, K, L) key), computed in linear time with a table over the key range when that range is at most
-    max_table_ratio x the number of observations (table memory ~9 bytes per possible key); otherwise np.unique."""
-    P = profiling.PROFILER
-    with P.step("to_array_index"):
-        ind, _ = hkl.to_array_index()
-    with P.step("pack_keys"):
-        sz = [int(np.max(j)) + 1 for j in ind]
-        key = np.ravel_multi_index(ind, sz)
-    n_keys = int(np.prod(sz, dtype=np.int64))
-    if n_keys <= max_table_ratio * key.size:
-        with P.step("key_table", n_keys=n_keys):
-            present = np.zeros(n_keys, dtype=bool)
-            present[key] = True
-            group_of_key = np.cumsum(present, dtype=np.int64) - 1
-            index_map = group_of_key[key]
-        logger.info("Grouping with a key table ({} possible keys, {} groups)", n_keys, int(group_of_key[-1]) + 1)
-        return index_map
-    logger.info("Grouping by sorting ({} possible keys > {} x {} observations)", n_keys, max_table_ratio, key.size)
-    with P.step("sort_unique", n_keys=n_keys):
-        return np.unique(key, return_inverse=True)[1].ravel()
-
-
-def _set_threads(nproc):
-    """numba threads for the fast engine, with mdx2's nproc convention (1 = sequential, -1 = all, -N = all but N-1).
-
-    Uses numba's workqueue threading layer unless NUMBA_THREADING_LAYER is set: numba 0.65.1's GNU OpenMP layer was
-    seen executing parallel-loop iterations more than once on a 96-core Linux node (wrong results, very slow)."""
-    import numba  # noqa: PLC0415 (optional dependency, fast engine only)
-
-    if "NUMBA_THREADING_LAYER" not in os.environ:
-        numba.config.THREADING_LAYER = "workqueue"
-    ncpu = numba.config.NUMBA_NUM_THREADS
-    n = nproc if nproc > 0 else max(1, ncpu + 1 + nproc)
-    numba.set_num_threads(min(n, ncpu))
-    logger.info(
-        "Fast engine: {} thread(s), numba threading layer {}", numba.get_num_threads(), numba.config.THREADING_LAYER
-    )
 
 
 def _instrument(MR, P):
