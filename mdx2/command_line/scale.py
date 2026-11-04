@@ -295,7 +295,8 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False, eng
         tmp.batch = n * np.ones_like(tmp.op)
         tabs.append(tmp)
 
-    hkl = HKLTable.concatenate(tabs)
+    with P.step("concatenate"):
+        hkl = HKLTable.concatenate(tabs)
 
     logger.info("Loaded {} reflections from {} file(s)", len(hkl), len(hkl_files))
 
@@ -464,18 +465,24 @@ def _group_index(hkl, max_table_ratio=4):
     """Group index of each observation: the same as HKLTable.unique()'s index_map (groups numbered in order of the
     packed (H, K, L) key), computed in linear time with a table over the key range when that range is at most
     max_table_ratio x the number of observations (table memory ~9 bytes per possible key); otherwise np.unique."""
-    ind, _ = hkl.to_array_index()
-    sz = [int(np.max(j)) + 1 for j in ind]
-    key = np.ravel_multi_index(ind, sz)
+    P = profiling.PROFILER
+    with P.step("to_array_index"):
+        ind, _ = hkl.to_array_index()
+    with P.step("pack_keys"):
+        sz = [int(np.max(j)) + 1 for j in ind]
+        key = np.ravel_multi_index(ind, sz)
     n_keys = int(np.prod(sz, dtype=np.int64))
     if n_keys <= max_table_ratio * key.size:
-        present = np.zeros(n_keys, dtype=bool)
-        present[key] = True
-        group_of_key = np.cumsum(present, dtype=np.int64) - 1
+        with P.step("key_table", n_keys=n_keys):
+            present = np.zeros(n_keys, dtype=bool)
+            present[key] = True
+            group_of_key = np.cumsum(present, dtype=np.int64) - 1
+            index_map = group_of_key[key]
         logger.info("Grouping with a key table ({} possible keys, {} groups)", n_keys, int(group_of_key[-1]) + 1)
-        return group_of_key[key]
+        return index_map
     logger.info("Grouping by sorting ({} possible keys > {} x {} observations)", n_keys, max_table_ratio, key.size)
-    return np.unique(key, return_inverse=True)[1].ravel()
+    with P.step("sort_unique", n_keys=n_keys):
+        return np.unique(key, return_inverse=True)[1].ravel()
 
 
 def _set_threads(nproc):
@@ -497,6 +504,13 @@ def _set_threads(nproc):
 
 def _instrument(MR, P):
     """Time the refiner's operations (no-op unless profiling is enabled)."""
+    for m, model in (
+        ("add_scaling_models", "b"),
+        ("add_offset_models", "c"),
+        ("add_absorption_models", "a"),
+        ("add_detector_model", "d"),
+    ):
+        P.wrap(MR, m, name="add_models", model=model)
     for m in ("apply", "bfit", "afit", "cfit", "dfit"):
         P.wrap(MR, m, name="fit_" + m[0] if m.endswith("fit") else m)
     P.wrap(MR.data, "merge")
