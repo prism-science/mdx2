@@ -13,6 +13,22 @@ New here? Have a look at our recent [Blog post](https://prismscience.org/researc
 
 ## Versions
 
+### Next version (unreleased, in `dev`)
+
+Faster `mdx2.scale`: the same alternating-least-squares algorithm, with compiled multi-threaded passes over the data.
+
+- `mdx2.scale` is 20-30x faster on large datasets and needs about half the memory. Two Eiger 16M sweeps (112M observations, `--mca2020`): 30 min, 40 GB -> 1 min, 17 GB on a 64-core node. Results match the previous version (chi2 at every refinement step; a few borderline outliers can differ).
+- `--nproc` sets the number of threads; the default (-1) uses all CPUs available to the process (respecting the affinity mask and container CPU quotas).
+- `--engine reference` runs the previous implementation (single-threaded; kept for one release).
+- `--profile` logs wall time and memory per step; `--profile_file` writes them as JSON lines.
+- Removed: pre-scaling (`--prescale.*`).
+- `mdx2.merge` uses the same compiled multi-threaded passes (applying scales, merging, outliers, splits); about 2x faster on the insulin example, where most of the remaining time is loading and saving. It also has `--nproc` (default -1, all available CPUs), `--profile` and `--profile_file`.
+- `mdx2.merge --split weightedRandomHalf`: weights are now accumulated in double precision. Previous versions summed float32 weights over the whole dataset, which put ~4% of observations in the wrong half (insulin example); half-dataset maps (and CC1/2) will differ slightly from earlier versions. Merged intensities agree to float32 precision.
+- Outlier rejection (`mdx2.scale`, `mdx2.merge --outlier`) is now two-sided: in each group of symmetry-equivalent observations, the one with the largest leave-one-out residual (against the weighted mean of the others) is masked if beyond the cutoff, repeated after each scaling stage (scale) or until none remain (merge; at most 100 rounds, typically under 15); both observations of a disagreeing pair are masked. Previous versions masked only observations below the merged value, so high outliers stayed in, and good observations next to a high outlier could be masked. On the insulin example this masks ~3x as many observations (1573 vs 545; 0.02% of the data). `--outlier_method legacy` restores the previous behaviour (kept for one release; always used by `--engine reference`).
+- Faster grouping of symmetry-equivalent observations (`HKLTable.unique`), used by `mdx2.scale` and `mdx2.merge`.
+- Scale files are unchanged, so downstream steps (`mdx2.merge`, `mdx2.reintegrate`, reports) work as before.
+- New dependencies: `numba`, `threadpoolctl`, `psutil`.
+
 ### Version 1.0.5
 
 A minor update to prepare the CLI for pipeline integration. Previous versions had to be invoked from the working directory. This version allows arbitrary directories to be set for all input and output files.
@@ -61,6 +77,15 @@ Recommended: add packages for Bragg processing, jupyter notebooks, and nexus vis
 ```bash
 mamba install jupyterlab dials xia2 nexpy
 ```
+
+## Performance notes
+
+`mdx2.scale` runs its passes over the data on multiple threads (numba). Typical memory: about 150 bytes per observation (17 GB for 112M observations).
+
+- Threads: `--nproc N` (default: all available CPUs). On shared machines, choose fewer.
+- Threading layer: mdx2 uses numba's `workqueue` layer. Set `NUMBA_THREADING_LAYER` to override; numba's OpenMP layer gave wrong results on some multi-core Linux nodes, and mdx2 stops with an error if a parallel pass miscounts observations.
+- Transparent huge pages: on Linux machines where huge pages are allocated with direct compaction (`/sys/kernel/mm/transparent_hugepage/defrag` set to `madvise`) and most memory is page cache, large numpy allocations can stall. If loading and grouping are unexpectedly slow (see `--profile`), try `NUMPY_MADVISE_HUGEPAGE=0`; on one shared node this made the run 2x faster. Where plenty of memory is free, huge pages help, so leave it on.
+- To check a new machine: `pytest tests/test_scaling_engines.py`, and on real data `MDX2_TEST_HKL=corrected.nxs pytest -s tests/test_scaling_real_data.py`.
 
 ## Contributing
 

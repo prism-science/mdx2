@@ -10,23 +10,10 @@ import numpy as np
 from loguru import logger
 from simple_parsing import field
 
+from mdx2 import profiling
 from mdx2.command_line import make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.io import loadobj, saveobj
-from mdx2.scaling import BatchModelRefiner, ScaledData
-
-
-@dataclass
-class PrescaleParameters:
-    """Options for initial quick refinement of models to a subset of data and/or isotropically averaged data"""
-
-    enable: bool = False  # include pre-scaling refinement
-    subsample: int = 10  # subsample factor for pre-scaling refinement
-    isotropic: bool = True  # use isotropically averaged data for pre-scaling refinement
-    scaling: bool = True  # include scaling model in pre-scaling refinement if scaling.enable is True
-    offset: bool = False  # include offset model in pre-scaling refinement if offset.enable is True
-    detector: bool = False  # include detector model in pre-scaling refinement if detector.enable is True
-    absorption: bool = True  # include absorption model in pre-scaling refinement if absorption.enable is True
 
 
 @dataclass
@@ -90,7 +77,6 @@ class Parameters:
     """Options for refining a scaling model to unmerged corrected intensities"""
 
     hkl: List[str] = field(positional=True, nargs="+")  # NeXus file(s) containing hkl_table
-    prescale: PrescaleParameters = field(default_factory=PrescaleParameters)
     scaling: ScalingModelParameters = field(default_factory=ScalingModelParameters)
     absorption: AbsorptionModelParameters = field(default_factory=AbsorptionModelParameters)
     detector: DetectorModelParameters = field(default_factory=DetectorModelParameters)
@@ -98,7 +84,18 @@ class Parameters:
     outfile: Optional[List[str]] = field(default=None, nargs="*")
     """name of the output NeXus file(s). If omitted, will attempt a sensible name such as scales.nxs"""
     logfile: str = "mdx2.scale.log"  # name of the log file
-    nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
+    nproc: int = -1
+    """threads: -1 = all available CPUs (respecting the affinity mask and container CPU quota), N = N threads,
+    -N = all available CPUs but N-1 (the reference engine is single-threaded)"""
+    engine: str = "fast"
+    """scaling engine: "fast" (default; compiled multi-threaded mdx2.scaling) or "reference" (the slower
+    implementation of mdx2 <= 1.0.5, mdx2.scaling_reference; same algorithm, kept for one release)"""
+    outlier_method: str = "two_sided"
+    """outlier rejection after each stage: "two_sided" (default; per symmetry-equivalent group, the observation with
+    the largest leave-one-out residual if beyond the cutoff, both observations of a disagreeing pair) or "legacy"
+    (mdx2 <= 1.0.5: observations below the merged value only; always used by the reference engine)"""
+    profile: bool = False  # log a summary of wall time and memory per step (load, apply, merge, fit, ...)
+    profile_file: Optional[str] = None  # write wall time and memory per step to this file (JSON lines)
     mca2020: bool = False
     """shortcut for --scaling.enable True --offset.enable True --detector.enable True --absorption.enable True"""
 
@@ -114,6 +111,10 @@ class Parameters:
         # Check for duplicate input files
         # Note: Same filename in different directories is valid (e.g., /path1/data.nxs, /path2/data.nxs)
         # But truly duplicate paths are not allowed (e.g., data.nxs, data.nxs)
+        if self.engine not in ("fast", "reference"):
+            raise ValueError(f"Unknown engine {self.engine!r} (use 'fast' or 'reference')")
+        if self.outlier_method not in ("two_sided", "legacy"):
+            raise ValueError(f"Unknown outlier_method {self.outlier_method!r} (use 'two_sided' or 'legacy')")
         if len(self.hkl) != len(set(self.hkl)):
             raise ValueError("Duplicate input files are not allowed")
 
@@ -159,14 +160,25 @@ def generate_default_outfiles(infiles):
     return None
 
 
-def mask_outliers(MR, outlier):
+def mask_outliers(MR, outlier, method="legacy"):
     """Mask outliers"""
     logger.info("    Applying scale factors...")
     MR.apply()
-    logger.info("    Merging...")
-    Im, _sigmam, _counts = MR.data.merge()
-    nout = MR.data.mask_outliers(Im, outlier)
-    logger.info("    Removed {} outliers (>{} sigma)", nout, outlier)
+    if method == "legacy":
+        logger.info("    Merging...")
+        Im, _sigmam, _counts = MR.data.merge()
+        nout = MR.data.mask_outliers(Im, outlier, method="legacy")
+        logger.info("    Removed {} outliers (>{} sigma)", nout, outlier)
+    else:
+        nout = MR.data.mask_outliers(None, outlier, method=method)
+        o = MR.data.last_outliers
+        logger.info(
+            "    Removed {} outliers (|leave-one-out residual| >{} sigma; {} high, {} low)",
+            nout,
+            outlier,
+            o["high"],
+            o["low"],
+        )
 
 
 def refine_offset_model(MR, offset_params):
@@ -273,41 +285,43 @@ def refine_absorption_model(MR, absorption_params):
         old_x2 = x2
 
 
-def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False):
-    """Load data from hkl files into a single HKLTable"""
+def load_data_for_scaling(*hkl_files, engine="fast"):
+    """Load hkl tables (one batch per file), group symmetry-equivalent observations, mask singletons."""
+    P = profiling.PROFILER
     tabs = []
     for n, fn in enumerate(hkl_files):
-        tmp = loadobj(fn, "hkl_table")
-        if subsample is not None:
-            tmp = tmp[::subsample]
+        with P.step("load", file=fn):
+            tmp = loadobj(fn, "hkl_table")
         tmp.batch = n * np.ones_like(tmp.op)
         tabs.append(tmp)
 
-    hkl = HKLTable.concatenate(tabs)
+    with P.step("concatenate"):
+        hkl = HKLTable.concatenate(tabs)
 
     logger.info("Loaded {} reflections from {} file(s)", len(hkl), len(hkl_files))
 
-    if merge_isotropic:
-        # TODO: should bin width be a parameter?
-        # (here we use 0.001 as a default bin width)
-        logger.info("Grouping by scattering vector length (isotropic averaging)...")
-        index_map = np.floor(hkl.s * 1000).astype(np.uint16)
-    else:
-        logger.info("Grouping redundant observations...")
+    logger.info("Grouping redundant observations...")
+    with P.step("group"):
         _, index_map, _ = hkl.unique()
 
-    S = ScaledData(
-        hkl.intensity,
-        hkl.intensity_error,
-        index_map,
-        phi=hkl.phi,
-        s=hkl.s,
-        ix=hkl.ix,
-        iy=hkl.iy,
-        batch=hkl.batch,
-    )
+    if engine == "reference":
+        from mdx2.scaling_reference import ScaledData  # noqa: PLC0415 (only for the reference engine)
+    else:
+        from mdx2.scaling import ScaledData  # noqa: PLC0415 (imports numba)
+    with P.step("init_data"):
+        S = ScaledData(
+            hkl.intensity,
+            hkl.intensity_error,
+            index_map,
+            phi=hkl.phi,
+            s=hkl.s,
+            ix=hkl.ix,
+            iy=hkl.iy,
+            batch=hkl.batch,
+        )
 
-    nsingletons = S.mask_singletons()
+    with P.step("mask_singletons"):
+        nsingletons = S.mask_singletons()
     if nsingletons > 0:
         logger.info("Masked {} singletons (reflections with only one observation)", nsingletons)
 
@@ -317,12 +331,22 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False):
 def run_scale(params):
     """Run the scale algorithm"""
 
-    S = load_data_for_scaling(*params.hkl)
+    profiling.PROFILER = P = profiling.Profiler(params.profile, params.profile_file)
 
+    S = load_data_for_scaling(*params.hkl, engine=params.engine)
+
+    if params.engine == "reference":
+        from mdx2.scaling_reference import BatchModelRefiner  # noqa: PLC0415
+
+        logger.info("Reference engine (single-threaded, legacy outlier rejection)")
+    else:
+        from mdx2.parallel import set_threads  # noqa: PLC0415
+        from mdx2.scaling import BatchModelRefiner  # noqa: PLC0415
+
+        set_threads(params.nproc)  # threads start after loading and grouping (plain numpy), before the first kernel
     MR = BatchModelRefiner(S)
-
-    if params.nproc != 1:
-        logger.warning("Serial execution only, ignoring nproc value")
+    _instrument(MR, P)
+    outlier_method = "legacy" if params.engine == "reference" else params.outlier_method
 
     if params.scaling.enable:
         MR.add_scaling_models(
@@ -345,75 +369,66 @@ def run_scale(params):
             niy=params.detector.ny,
         )
 
-    # prescaling phase
-    if params.prescale.enable:
-        if params.prescale.subsample > 1:
-            subsample = params.prescale.subsample
-        else:
-            subsample = None
-        S_pre = load_data_for_scaling(*params.hkl, subsample=subsample, merge_isotropic=params.prescale.isotropic)
-        MR_pre = BatchModelRefiner(S_pre)
-        # transfer models to prescaling refiner
-        for model_refiner, model_refiner_pre in zip(MR.batch_refiners, MR_pre.batch_refiners):
-            model_refiner_pre.scaling.model = model_refiner.scaling.model
-            model_refiner_pre.offset.model = model_refiner.offset.model
-            model_refiner_pre.detector.model = model_refiner.detector.model
-            model_refiner_pre.absorption.model = model_refiner.absorption.model
-        # refine models on prescaling data
-        logger.info("Starting prescaling refinement...")
-        if params.prescale.scaling and params.scaling.enable:
-            logger.info("Optimizing scale vs. phi (b)...")
-            refine_scaling_model(MR_pre, params.scaling)
-            mask_outliers(MR_pre, params.scaling.outlier)
-        if params.prescale.offset and params.prescale.scaling and params.offset.enable and params.scaling.enable:
-            logger.info("Optimizing scaling and offset models together (b,c)...")
-            refine_scaling_and_offset_model(MR_pre, params.scaling, params.offset)
-            mask_outliers(MR_pre, params.offset.outlier)
-        if params.prescale.offset and params.offset.enable:
-            logger.info("Optimizing offset vs. phi and resolution (c)...")
-            refine_offset_model(MR_pre, params.offset)
-            mask_outliers(MR_pre, params.offset.outlier)
-        if params.prescale.detector and params.detector.enable:
-            logger.info("Optimizing scale vs. detector position (d)...")
-            refine_detector_model(MR_pre, params.detector)
-            mask_outliers(MR_pre, params.detector.outlier)
-        if params.prescale.absorption and params.absorption.enable:
-            logger.info("Optimizing scale vs. detector position and phi (a)...")
-            refine_absorption_model(MR_pre, params.absorption)
-            mask_outliers(MR_pre, params.absorption.outlier)
-        logger.info("Prescaling refinement completed")
-
     logger.info("Starting main scaling refinement...")
 
     if params.scaling.enable:
         logger.info("Optimizing scale vs. phi (b)...")
+        P.stage = "b"
         refine_scaling_model(MR, params.scaling)
-        mask_outliers(MR, params.scaling.outlier)
+        mask_outliers(MR, params.scaling.outlier, outlier_method)
 
     if params.scaling.enable and params.offset.enable:
         logger.info("Optimizing scaling and offset models together (b,c)...")
+        P.stage = "b,c"
         refine_scaling_and_offset_model(MR, params.scaling, params.offset)
-        mask_outliers(MR, params.offset.outlier)
+        mask_outliers(MR, params.offset.outlier, outlier_method)
 
     if params.offset.enable:
         logger.info("Optimizing offset vs. phi and resolution (c)...")
+        P.stage = "c"
         refine_offset_model(MR, params.offset)
-        mask_outliers(MR, params.offset.outlier)
+        mask_outliers(MR, params.offset.outlier, outlier_method)
 
     if params.detector.enable:
         logger.info("Optimizing scale vs. detector position (d)...")
+        P.stage = "d"
         refine_detector_model(MR, params.detector)
-        mask_outliers(MR, params.detector.outlier)
+        mask_outliers(MR, params.detector.outlier, outlier_method)
 
     if params.absorption.enable:
         logger.info("Optimizing scale vs. detector position and phi (a)...")
+        P.stage = "a"
         refine_absorption_model(MR, params.absorption)
-        mask_outliers(MR, params.absorption.outlier)
+        mask_outliers(MR, params.absorption.outlier, outlier_method)
 
     logger.info("Refinement completed")
 
     logger.info("Saving scaling models...")
-    for model_refiner, fn in zip(MR.batch_refiners, params.outfile):
+    P.stage = None
+    with P.step("save"):
+        _save_models(MR, params.outfile)
+    P.summary()
+
+    logger.info("Scaling completed successfully")
+
+
+def _instrument(MR, P):
+    """Time the refiner's operations (no-op unless profiling is enabled)."""
+    for m, model in (
+        ("add_scaling_models", "b"),
+        ("add_offset_models", "c"),
+        ("add_absorption_models", "a"),
+        ("add_detector_model", "d"),
+    ):
+        P.wrap(MR, m, name="add_models", model=model)
+    for m in ("apply", "bfit", "afit", "cfit", "dfit"):
+        P.wrap(MR, m, name="fit_" + m[0] if m.endswith("fit") else m)
+    P.wrap(MR.data, "merge")
+    P.wrap(MR.data, "mask_outliers")
+
+
+def _save_models(MR, outfiles):
+    for model_refiner, fn in zip(MR.batch_refiners, outfiles):
         models = dict(
             scaling_model=model_refiner.scaling.model,
             detector_model=model_refiner.detector.model,
@@ -426,8 +441,6 @@ def run_scale(params):
             if model is not None:
                 saveobj(model, fn, name=name, append=file_created)
                 file_created = True
-
-    logger.info("Scaling completed successfully")
 
 
 # NOTE: parse_arguments is imported by the testing framework

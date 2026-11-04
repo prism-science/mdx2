@@ -28,6 +28,9 @@ dependencies = [
     "simple-parsing",
     "loguru",
     "papermill",
+    "numba",
+    "threadpoolctl",
+    "psutil",
 ]
 # dxtbx needs to be installed with conda
 

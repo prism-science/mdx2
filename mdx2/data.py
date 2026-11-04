@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from nexusformat.nexus import NXdata, NXfield, NXgroup, NXreflections, NXvirtualfield
 
+from mdx2 import profiling
 from mdx2.dxtbx_machinery import Experiment
 from mdx2.io import nxload, saveobj
 
@@ -153,14 +154,31 @@ class HKLTable:
         hkl = [(ind + o) / n for ind, o, n in zip(hklind, Ori, self.ndiv)]
         return tuple(hkl)
 
-    def unique(self):
-        ind, Origin = self.to_array_index()
-        sz = [np.max(j) + 1 for j in ind]
-        unique_index, index_map, counts = np.unique(
-            np.ravel_multi_index(ind, sz),
-            return_inverse=True,
-            return_counts=True,
-        )
+    def unique(self, max_table_ratio=4):
+        """Unique (h, k, l), the index of each row's group, and group counts (groups in order of the packed key).
+
+        Rows are grouped by the packed (H, K, L) key. When the key range is at most max_table_ratio x the number of
+        rows (table ~9 bytes per possible key), groups are numbered in linear time with a table over the key range
+        (mark keys present, cumulative sum); otherwise with np.unique (a sort). Both give the same result.
+        """
+        P = profiling.PROFILER
+        with P.step("to_array_index"):
+            ind, Origin = self.to_array_index()
+        with P.step("pack_keys"):
+            sz = [int(np.max(j)) + 1 for j in ind]
+            key = np.ravel_multi_index(ind, sz)
+        n_keys = int(np.prod(sz, dtype=np.int64))
+        if n_keys <= max_table_ratio * key.size:
+            with P.step("key_table", n_keys=n_keys):
+                present = np.zeros(n_keys, dtype=bool)
+                present[key] = True
+                unique_index = np.flatnonzero(present)
+                index_map = (np.cumsum(present, dtype=np.int64) - 1)[key]
+                counts = np.bincount(index_map, minlength=unique_index.size)
+        else:
+            with P.step("sort_unique", n_keys=n_keys):
+                unique_index, index_map, counts = np.unique(key, return_inverse=True, return_counts=True)
+                index_map = index_map.ravel()
         hkl = self.from_array_index(unique_index, sz, Ori=Origin)
         return hkl, index_map, counts
 
