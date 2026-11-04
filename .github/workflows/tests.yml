@@ -1,0 +1,38 @@
+# Unit tests (pytest) on Linux and macOS.
+# Runs on pull requests (all branches), on pushes to dev (the pre-release branch), and manually (Actions tab ->
+# tests -> Run workflow). A newer push to the same PR or branch cancels the run in progress.
+name: tests
+
+on:
+  pull_request:
+    paths-ignore: ["**.md", "examples/**"]
+  push:
+    branches: [dev]
+    paths-ignore: ["**.md", "examples/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -el {0}  # login shell, so the micromamba environment is active
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: env.yaml  # conda dependencies (dxtbx is conda-only)
+          environment-name: mdx2-ci
+          cache-environment: true
+      - name: Install mdx2 (pip-only dependencies from pyproject.toml)
+        run: pip install -e ".[test]"
+      - name: Run tests
+        run: pytest -q
