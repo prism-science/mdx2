@@ -60,6 +60,8 @@ class Parameters:
             )
 
 
+MAX_OUTLIER_ROUNDS = 100  # safety cap for two-sided rejection (insulin: 7 rounds at 5 sigma, 13 at 3 sigma)
+
 # note: negative_prefix is used to allow --no-scaling, --no-offset, etc. for consistency with old argparse api
 # future: could switch split to an Enum type, to simplify selection of choices by alternate APIs
 
@@ -122,6 +124,11 @@ def run_merge(params):
             else:
                 nout = high = low = rounds = 0
                 while True:  # at most one per group per round
+                    if rounds == MAX_OUTLIER_ROUNDS:
+                        logger.warning(
+                            "Outlier rejection stopped after {} rounds (still finding outliers)", MAX_OUTLIER_ROUNDS
+                        )
+                        break
                     n = S.mask_outliers(None, params.outlier)
                     if n == 0:
                         break

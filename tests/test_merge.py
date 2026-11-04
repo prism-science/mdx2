@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from nexusformat.nexus import nxload
 
+import mdx2.command_line.merge as merge_cli
 from mdx2.command_line.merge import Parameters, run_merge
 from mdx2.data import HKLTable
 from mdx2.io import loadobj, saveobj
@@ -159,3 +160,15 @@ def test_merge_matches_reference(tmp_path, opts, nthreads):
             np.testing.assert_array_equal(got, want, err_msg=key)
         else:
             np.testing.assert_allclose(got, want.astype(np.float32), rtol=1e-6, equal_nan=True, err_msg=key)
+
+
+def test_merge_two_sided_outliers(tmp_path, monkeypatch):
+    """Default method: repeated rounds until none, capped (a cap of 1 stops after one round)."""
+    hkl_files, scale_files = write_inputs(tmp_path)
+    counts = {}
+    for cap in (100, 1):
+        monkeypatch.setattr(merge_cli, "MAX_OUTLIER_ROUNDS", cap)
+        out = str(tmp_path / f"merged_{cap}.nxs")
+        run_merge(Parameters(hkl=hkl_files, scale=scale_files, outfile=out, outlier=3.0))
+        counts[cap] = loadobj(out, "hkl_table").count.sum()
+    assert counts[100] < counts[1]  # more rounds, more outliers removed
