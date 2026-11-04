@@ -8,35 +8,16 @@ a runtime fails loudly instead of producing wrong results.
 
 import os
 
+import joblib
 import numba as nb
 from loguru import logger
 
 
 def available_cpus():
-    """CPUs this process may use: the affinity mask and, in containers, the cgroup CPU quota (whichever is smaller).
-    os.cpu_count() reports the whole machine (e.g. 104 on a pod limited to 64 cores)."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except AttributeError:  # macOS
-        n = os.cpu_count() or 1
-    for quota_file, period_file in (
-        ("/sys/fs/cgroup/cpu.max", None),  # cgroup v2: "<quota> <period>" or "max <period>"
-        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),  # cgroup v1
-    ):
-        try:
-            with open(quota_file) as f:
-                fields = f.read().split()
-            if period_file is None:
-                quota, period = fields[0], fields[1]
-            else:
-                with open(period_file) as f:
-                    quota, period = fields[0], f.read().split()[0]
-            if quota not in ("max", "-1"):
-                n = min(n, max(1, int(quota) // int(period)))
-            break
-        except (OSError, ValueError, IndexError):
-            continue
-    return max(1, n)
+    """CPUs this process may use, as joblib (loky) counts them: the affinity mask, the cgroup v1/v2 CPU quota in
+    containers, and the LOKY_MAX_CPU_COUNT environment variable, whichever is smallest (os.cpu_count() reports the
+    whole machine, e.g. 104 on a pod limited to 4 cores). The same count joblib uses for mdx2's other commands."""
+    return max(1, joblib.cpu_count())
 
 
 def set_threads(nproc):
