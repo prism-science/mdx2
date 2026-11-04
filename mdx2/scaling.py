@@ -19,7 +19,15 @@ from scipy import sparse
 from scipy.sparse.linalg import lsqr
 from threadpoolctl import threadpool_limits
 
-from mdx2._scaling_kernels import k_apply, k_group_order, k_merge, k_normal, k_outliers, k_values
+from mdx2._scaling_kernels import (
+    k_apply,
+    k_group_order,
+    k_merge,
+    k_normal,
+    k_outliers,
+    k_split_half,
+    k_values,
+)
 from mdx2.parallel import check_count
 from mdx2.profiling import note
 
@@ -668,12 +676,37 @@ class ScaledData:
         self.mask |= single
         return int(single.sum())
 
-    def merge(self):
+    def merge(self, mask=None):
+        """Inverse-variance weighted mean per group of the scaled observations not masked (by `mask`, default
+        self.mask). Returns Im, sigma_m (NaN for empty groups) and counts."""
+        mask = self.mask if mask is None else np.ascontiguousarray(mask, dtype=np.bool_)
         G = self._ihmax + 1
         Im, sigm, counts = np.empty(G), np.empty(G), np.empty(G, dtype=np.int64)
-        k_merge(self._gstart, self._order, self.mask, self._I, self._sigma, self.scale, self.offset, Im, sigm, counts)
-        check_count("mdx2.scaling merge", int(counts.sum()), self.count())
+        k_merge(self._gstart, self._order, mask, self._I, self._sigma, self.scale, self.offset, Im, sigm, counts)
+        check_count("mdx2.scaling merge", int(counts.sum()), int(np.count_nonzero(~mask)))
         return Im, sigm, counts
+
+    def weights(self):
+        """Inverse variances of the scaled observations, (scale / sigma)^2; 0 where masked."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = (self.scale / self._sigma) ** 2
+        w[self.mask] = 0.0
+        return w
+
+    def split_half(self, w, jitter, flips):
+        """mdx2.merge's weighted random half split: within each group, observations in random order (by `jitter`)
+        go to the first half once their cumulative weight `w` passes half the group's total, swapped where
+        `flips[group]` is set. Returns a boolean array (True = first half)."""
+        out = np.empty(len(self), dtype=np.bool_)
+        k_split_half(
+            self._gstart,
+            self._order,
+            np.ascontiguousarray(jitter, dtype=np.float64),
+            np.ascontiguousarray(w, dtype=np.float64),
+            np.ascontiguousarray(flips, dtype=np.int64),
+            out,
+        )
+        return out
 
     def mask_outliers(self, Im, nsigma):
         return int(
@@ -797,10 +830,23 @@ class BatchModelRefiner:
 
     @property
     def batch_refiners(self):
-        return iter(
-            _BatchView({k: t.model for k, t in dict(terms, d=self.dterm).items() if t is not None})
-            for terms in self.terms
-        )
+        views = []
+        for terms in self.terms:
+            models = {k: t.model for k, t in terms.items()}
+            if self.dterm is not None:
+                models["d"] = self.dterm.model
+            views.append(_BatchView(models))
+        return iter(views)
+
+    _COORDS = dict(b=("_phi",), a=("_ix", "_iy", "_phi"), c=("_s", "_phi"), d=("_ix", "_iy"))
+
+    def set_model(self, k, name, model):
+        """Use a given model (e.g. from a scale file) on batch k: name "b" (scaling), "a" (absorption), "c" (offset)
+        or "d" (detector, per batch as in mdx2.merge). Values update at once; apply() then sets scale and offset."""
+        D = self.data
+        t = _Term(model, tuple(getattr(D, a) for a in self._COORDS[name]), D._batches[k], [])
+        self.terms[k][name] = t
+        self._update_values(name, t)
 
     # -- apply / fits ------------------------------------------------------------------------------------------------
 

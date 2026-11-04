@@ -221,3 +221,26 @@ def k_outliers(mask, I, sigma, ih, Im, scale, offset, nsigma, nchunk):
                 cnt_c += 1
         cnt[c, 0] = cnt_c
     return cnt[:, 0].sum()
+
+
+@nb.njit(parallel=True, cache=True)
+def k_split_half(gstart, order, jitter, w, flips, out):
+    """mdx2.merge weighted random half split, per group: members ordered by jitter; with cumulative weight
+    c_t = w[1] + ... + w[t] (excluding the first member), member t goes to half 1 if c_t > c_last / 2, xor flips[g]."""
+    G = gstart.size - 1
+    for h in nb.prange(G):
+        a = gstart[h]
+        m = gstart[h + 1] - a
+        if m == 0:
+            continue
+        idx = order[a : a + m]
+        srt = idx[np.argsort(jitter[idx])]
+        tot = 0.0
+        for t in range(1, m):
+            tot += w[srt[t]]
+        f = flips[h] != 0
+        acc = 0.0
+        for t in range(m):
+            if t > 0:
+                acc += w[srt[t]]
+            out[srt[t]] = (acc > 0.5 * tot) != f

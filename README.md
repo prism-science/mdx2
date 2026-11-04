@@ -22,7 +22,9 @@ Faster `mdx2.scale`: the same alternating-least-squares algorithm, with compiled
 - `--engine reference` runs the previous implementation (single-threaded; kept for one release).
 - `--profile` logs wall time and memory per step; `--profile_file` writes them as JSON lines.
 - Removed: pre-scaling (`--prescale.*`).
-- Faster grouping of symmetry-equivalent observations (`HKLTable.unique`), used by `mdx2.scale`.
+- `mdx2.merge` uses the same compiled multi-threaded passes (applying scales, merging, outliers, splits); about 2x faster on the insulin example, where most of the remaining time is loading and saving. It also has `--nproc` (default -1, all available CPUs), `--profile` and `--profile_file`.
+- `mdx2.merge --split weightedRandomHalf`: weights are now accumulated in double precision. Previous versions summed float32 weights over the whole dataset, which put ~4% of observations in the wrong half (insulin example); half-dataset maps (and CC1/2) will differ slightly from earlier versions. Merged intensities agree to float32 precision.
+- Faster grouping of symmetry-equivalent observations (`HKLTable.unique`), used by `mdx2.scale` and `mdx2.merge`.
 - Scale files are unchanged, so downstream steps (`mdx2.merge`, `mdx2.reintegrate`, reports) work as before.
 - New dependencies: `numba`, `threadpoolctl`, `psutil`.
 
