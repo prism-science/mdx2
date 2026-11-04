@@ -4,6 +4,8 @@ import numpy as np
 from nexusformat.nexus import NXdata, NXfield
 from scipy import sparse
 
+from mdx2.profiling import note
+
 try:
     import xarray as xr
 except ImportError:
@@ -788,7 +790,9 @@ class ScalingModelRefiner(_ModelRefiner):
         alpha = alpha_mult * AA.trace() / BB.trace()
         G = AA + alpha * BB
         if sparse.issparse(G):
-            ufit = sparse.linalg.lsqr(G, Ay)[0]
+            res = sparse.linalg.lsqr(G, Ay)
+            ufit = res[0]
+            note(lsqr_iters=int(res[2]), n_params=int(G.shape[0]), nnz_G=int(G.nnz))
         else:
             ufit = np.linalg.lstsq(G, Ay, rcond=None)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
@@ -842,7 +846,9 @@ class AbsorptionModelRefiner(_ModelRefiner):
         alpha_z = alpha_z_mult * AA.trace() / BBz.trace()
         G = AA + alpha_xy * BBxy + alpha_z * BBz
         if sparse.issparse(G):
-            ufit = sparse.linalg.lsqr(G, Ay)[0]
+            res = sparse.linalg.lsqr(G, Ay)
+            ufit = res[0]
+            note(lsqr_iters=int(res[2]), n_params=int(G.shape[0]), nnz_G=int(G.nnz))
         else:
             ufit = np.linalg.lstsq(G, Ay, rcond=None)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
@@ -898,7 +904,9 @@ class OffsetModelRefiner(_ModelRefiner):
         alpha_c = alpha_c_mult * np.max(AA.diagonal()) / np.max(H.diagonal())
         G = AA + alpha_x * BBx + alpha_y * BBy + alpha_c * H
         if sparse.issparse(G):
-            ufit = sparse.linalg.lsqr(G, Ay)[0]
+            res = sparse.linalg.lsqr(G, Ay)
+            ufit = res[0]
+            note(lsqr_iters=int(res[2]), n_params=int(G.shape[0]), nnz_G=int(G.nnz))
         else:
             ufit = np.linalg.lstsq(G, Ay, rcond=None)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy
@@ -952,7 +960,9 @@ class DetectorModelRefiner(_ModelRefiner):
         alpha = alpha_mult * AA.trace() / BB.trace()
         G = AA + alpha * BB
         if sparse.issparse(G):
-            ufit = sparse.linalg.lsqr(G, Ay)[0]
+            res = sparse.linalg.lsqr(G, Ay)
+            ufit = res[0]
+            note(lsqr_iters=int(res[2]), n_params=int(G.shape[0]), nnz_G=int(G.nnz))
         else:
             ufit = np.linalg.lstsq(G, rcond=None)[0]
         x2 = ufit @ AA @ ufit - 2 * ufit @ Ay + yy

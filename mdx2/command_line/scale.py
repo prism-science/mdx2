@@ -10,6 +10,7 @@ import numpy as np
 from loguru import logger
 from simple_parsing import field
 
+from mdx2 import profiling
 from mdx2.command_line import make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.io import loadobj, saveobj
@@ -99,6 +100,11 @@ class Parameters:
     """name of the output NeXus file(s). If omitted, will attempt a sensible name such as scales.nxs"""
     logfile: str = "mdx2.scale.log"  # name of the log file
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
+    engine: str = "default"
+    """scaling engine: "default" (mdx2.scaling) or "fast" (same algorithm, compiled multi-threaded passes over the
+    data; needs numba; threads from --nproc). Prescaling is not supported by the fast engine."""
+    profile: bool = False  # log a summary of wall time and memory per step (load, apply, merge, fit, ...)
+    profile_file: Optional[str] = None  # write wall time and memory per step to this file (JSON lines)
     mca2020: bool = False
     """shortcut for --scaling.enable True --offset.enable True --detector.enable True --absorption.enable True"""
 
@@ -114,6 +120,10 @@ class Parameters:
         # Check for duplicate input files
         # Note: Same filename in different directories is valid (e.g., /path1/data.nxs, /path2/data.nxs)
         # But truly duplicate paths are not allowed (e.g., data.nxs, data.nxs)
+        if self.engine not in ("default", "fast"):
+            raise ValueError(f"Unknown engine {self.engine!r} (use 'default' or 'fast')")
+        if self.engine == "fast" and self.prescale.enable:
+            raise ValueError("--prescale.enable is not supported with --engine fast")
         if len(self.hkl) != len(set(self.hkl)):
             raise ValueError("Duplicate input files are not allowed")
 
@@ -273,11 +283,13 @@ def refine_absorption_model(MR, absorption_params):
         old_x2 = x2
 
 
-def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False):
+def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False, engine="default"):
     """Load data from hkl files into a single HKLTable"""
+    P = profiling.PROFILER
     tabs = []
     for n, fn in enumerate(hkl_files):
-        tmp = loadobj(fn, "hkl_table")
+        with P.step("load", file=fn):
+            tmp = loadobj(fn, "hkl_table")
         if subsample is not None:
             tmp = tmp[::subsample]
         tmp.batch = n * np.ones_like(tmp.op)
@@ -294,9 +306,14 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False):
         index_map = np.floor(hkl.s * 1000).astype(np.uint16)
     else:
         logger.info("Grouping redundant observations...")
-        _, index_map, _ = hkl.unique()
+        with P.step("group"):
+            _, index_map, _ = hkl.unique()
 
-    S = ScaledData(
+    if engine == "fast":
+        from mdx2.fast_scaling import FastScaledData as data_class  # noqa: PLC0415 (numba is optional)
+    else:
+        data_class = ScaledData
+    S = data_class(
         hkl.intensity,
         hkl.intensity_error,
         index_map,
@@ -307,7 +324,8 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False):
         batch=hkl.batch,
     )
 
-    nsingletons = S.mask_singletons()
+    with P.step("mask_singletons"):
+        nsingletons = S.mask_singletons()
     if nsingletons > 0:
         logger.info("Masked {} singletons (reflections with only one observation)", nsingletons)
 
@@ -317,12 +335,22 @@ def load_data_for_scaling(*hkl_files, subsample=None, merge_isotropic=False):
 def run_scale(params):
     """Run the scale algorithm"""
 
-    S = load_data_for_scaling(*params.hkl)
+    profiling.PROFILER = P = profiling.Profiler(params.profile, params.profile_file)
 
-    MR = BatchModelRefiner(S)
+    if params.engine == "fast":
+        _set_threads(params.nproc)
 
-    if params.nproc != 1:
-        logger.warning("Serial execution only, ignoring nproc value")
+    S = load_data_for_scaling(*params.hkl, engine=params.engine)
+
+    if params.engine == "fast":
+        from mdx2.fast_scaling import FastBatchModelRefiner  # noqa: PLC0415 (numba is optional)
+
+        MR = FastBatchModelRefiner(S)
+    else:
+        MR = BatchModelRefiner(S)
+        if params.nproc != 1:
+            logger.warning("Serial execution only, ignoring nproc value")
+    _instrument(MR, P)
 
     if params.scaling.enable:
         MR.add_scaling_models(
@@ -353,6 +381,7 @@ def run_scale(params):
             subsample = None
         S_pre = load_data_for_scaling(*params.hkl, subsample=subsample, merge_isotropic=params.prescale.isotropic)
         MR_pre = BatchModelRefiner(S_pre)
+        _instrument(MR_pre, P)
         # transfer models to prescaling refiner
         for model_refiner, model_refiner_pre in zip(MR.batch_refiners, MR_pre.batch_refiners):
             model_refiner_pre.scaling.model = model_refiner.scaling.model
@@ -363,22 +392,27 @@ def run_scale(params):
         logger.info("Starting prescaling refinement...")
         if params.prescale.scaling and params.scaling.enable:
             logger.info("Optimizing scale vs. phi (b)...")
+            P.stage = "pre b"
             refine_scaling_model(MR_pre, params.scaling)
             mask_outliers(MR_pre, params.scaling.outlier)
         if params.prescale.offset and params.prescale.scaling and params.offset.enable and params.scaling.enable:
             logger.info("Optimizing scaling and offset models together (b,c)...")
+            P.stage = "pre b,c"
             refine_scaling_and_offset_model(MR_pre, params.scaling, params.offset)
             mask_outliers(MR_pre, params.offset.outlier)
         if params.prescale.offset and params.offset.enable:
             logger.info("Optimizing offset vs. phi and resolution (c)...")
+            P.stage = "pre c"
             refine_offset_model(MR_pre, params.offset)
             mask_outliers(MR_pre, params.offset.outlier)
         if params.prescale.detector and params.detector.enable:
             logger.info("Optimizing scale vs. detector position (d)...")
+            P.stage = "pre d"
             refine_detector_model(MR_pre, params.detector)
             mask_outliers(MR_pre, params.detector.outlier)
         if params.prescale.absorption and params.absorption.enable:
             logger.info("Optimizing scale vs. detector position and phi (a)...")
+            P.stage = "pre a"
             refine_absorption_model(MR_pre, params.absorption)
             mask_outliers(MR_pre, params.absorption.outlier)
         logger.info("Prescaling refinement completed")
@@ -387,33 +421,65 @@ def run_scale(params):
 
     if params.scaling.enable:
         logger.info("Optimizing scale vs. phi (b)...")
+        P.stage = "b"
         refine_scaling_model(MR, params.scaling)
         mask_outliers(MR, params.scaling.outlier)
 
     if params.scaling.enable and params.offset.enable:
         logger.info("Optimizing scaling and offset models together (b,c)...")
+        P.stage = "b,c"
         refine_scaling_and_offset_model(MR, params.scaling, params.offset)
         mask_outliers(MR, params.offset.outlier)
 
     if params.offset.enable:
         logger.info("Optimizing offset vs. phi and resolution (c)...")
+        P.stage = "c"
         refine_offset_model(MR, params.offset)
         mask_outliers(MR, params.offset.outlier)
 
     if params.detector.enable:
         logger.info("Optimizing scale vs. detector position (d)...")
+        P.stage = "d"
         refine_detector_model(MR, params.detector)
         mask_outliers(MR, params.detector.outlier)
 
     if params.absorption.enable:
         logger.info("Optimizing scale vs. detector position and phi (a)...")
+        P.stage = "a"
         refine_absorption_model(MR, params.absorption)
         mask_outliers(MR, params.absorption.outlier)
 
     logger.info("Refinement completed")
 
     logger.info("Saving scaling models...")
-    for model_refiner, fn in zip(MR.batch_refiners, params.outfile):
+    P.stage = None
+    with P.step("save"):
+        _save_models(MR, params.outfile)
+    P.summary()
+
+    logger.info("Scaling completed successfully")
+
+
+def _set_threads(nproc):
+    """numba threads for the fast engine, with mdx2's nproc convention (1 = sequential, -1 = all, -N = all but N-1)."""
+    import numba  # noqa: PLC0415 (optional dependency, fast engine only)
+
+    ncpu = numba.config.NUMBA_NUM_THREADS
+    n = nproc if nproc > 0 else max(1, ncpu + 1 + nproc)
+    numba.set_num_threads(min(n, ncpu))
+    logger.info("Fast engine: {} thread(s)", numba.get_num_threads())
+
+
+def _instrument(MR, P):
+    """Time the refiner's operations (no-op unless profiling is enabled)."""
+    for m in ("apply", "bfit", "afit", "cfit", "dfit"):
+        P.wrap(MR, m, name="fit_" + m[0] if m.endswith("fit") else m)
+    P.wrap(MR.data, "merge")
+    P.wrap(MR.data, "mask_outliers")
+
+
+def _save_models(MR, outfiles):
+    for model_refiner, fn in zip(MR.batch_refiners, outfiles):
         models = dict(
             scaling_model=model_refiner.scaling.model,
             detector_model=model_refiner.detector.model,
@@ -426,8 +492,6 @@ def run_scale(params):
             if model is not None:
                 saveobj(model, fn, name=name, append=file_created)
                 file_created = True
-
-    logger.info("Scaling completed successfully")
 
 
 # NOTE: parse_arguments is imported by the testing framework
