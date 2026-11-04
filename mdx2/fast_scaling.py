@@ -40,6 +40,21 @@ from mdx2.scaling import (
 KIND_B, KIND_A, KIND_C, KIND_D = 0, 1, 2, 3
 
 
+def _check(what, got, expected):
+    """Guard against a threading runtime that executes parallel-loop iterations more than once (seen with numba
+    0.65.1's GNU OpenMP layer on a 96-core Linux node: inflated sums, negative chi2)."""
+    if got != expected:
+        try:
+            layer = nb.threading_layer()
+        except ValueError:  # not initialized yet
+            layer = nb.config.THREADING_LAYER
+        raise RuntimeError(
+            f"fast scaling engine: {what} counted {got} observations, expected {expected}. The numba threading layer "
+            f"({layer}) is not executing parallel loops correctly on this machine; run with "
+            f"NUMBA_THREADING_LAYER=workqueue (the fast engine's default) or --engine default."
+        )
+
+
 # ---- kernels ------------------------------------------------------------------------------------------------------
 
 
@@ -328,6 +343,7 @@ class FastScaledData:
         G = self._ihmax + 1
         Im, sigm, counts = np.empty(G), np.empty(G), np.empty(G, dtype=np.int64)
         k_merge(self._gstart, self._order, self.mask, self._I, self._sigma, self.scale, self.offset, Im, sigm, counts)
+        _check("merge", int(counts.sum()), self.count())
         return Im, sigm, counts
 
     def mask_outliers(self, Im, nsigma):
@@ -490,6 +506,7 @@ class FastBatchModelRefiner:
             v["d"],
             D.nchunk,
         )
+        _check("fit", int(count), D.count(t.rows))
         AA = g.to_csr(slots)
         trAA = AA.diagonal().sum()
         G = AA.copy()

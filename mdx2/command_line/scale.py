@@ -461,13 +461,20 @@ def run_scale(params):
 
 
 def _set_threads(nproc):
-    """numba threads for the fast engine, with mdx2's nproc convention (1 = sequential, -1 = all, -N = all but N-1)."""
+    """numba threads for the fast engine, with mdx2's nproc convention (1 = sequential, -1 = all, -N = all but N-1).
+
+    Uses numba's workqueue threading layer unless NUMBA_THREADING_LAYER is set: numba 0.65.1's GNU OpenMP layer was
+    seen executing parallel-loop iterations more than once on a 96-core Linux node (wrong results, very slow)."""
     import numba  # noqa: PLC0415 (optional dependency, fast engine only)
 
+    if "NUMBA_THREADING_LAYER" not in os.environ:
+        numba.config.THREADING_LAYER = "workqueue"
     ncpu = numba.config.NUMBA_NUM_THREADS
     n = nproc if nproc > 0 else max(1, ncpu + 1 + nproc)
     numba.set_num_threads(min(n, ncpu))
-    logger.info("Fast engine: {} thread(s)", numba.get_num_threads())
+    logger.info(
+        "Fast engine: {} thread(s), numba threading layer {}", numba.get_num_threads(), numba.config.THREADING_LAYER
+    )
 
 
 def _instrument(MR, P):
