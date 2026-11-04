@@ -108,7 +108,7 @@ def _stencil(i, nd, x0, x1, x2, lo, hi, w0, dw, N, idx, wts, c):
     return True
 
 
-@nb.njit(parallel=True, cache=True)
+@nb.njit(parallel=True, cache=True, error_model="numpy")
 def k_values(nd, x0, x1, x2, lo, hi, w0, dw, N, u, r0, r1, out, nchunk):
     """out[i] = interpolated u at observation i (0 outside the grid, as mdx2), rows r0..r1."""
     K = 1 << nd
@@ -126,7 +126,7 @@ def k_values(nd, x0, x1, x2, lo, hi, w0, dw, N, u, r0, r1, out, nchunk):
             out[i] = acc
 
 
-@nb.njit(parallel=True, cache=True)
+@nb.njit(parallel=True, cache=True, error_model="numpy")
 def k_normal(kind, nd, x0, x1, x2, lo, hi, w0, dw, N, tab, r0, r1, mask, I, sigma, ih, Im, va, vb, vc, vd, nchunk):
     """One pass: A'A (neighbour slots), A'y, y'y and the count, for model `kind` with mdx2's weights:
     b: sigma' = sigma/(a d), y = (I/(a d) - c)/sigma', p = Im/sigma'
@@ -198,7 +198,17 @@ def k_normal(kind, nd, x0, x1, x2, lo, hi, w0, dw, N, tab, r0, r1, mask, I, sigm
     return out, aty, yy[:, 0].sum(), cnt[:, 0].sum()
 
 
-@nb.njit(parallel=True, cache=True)
+@nb.njit(parallel=True, cache=True, error_model="numpy")
+def k_apply(va, vb, vc, vd, scale, offset, nchunk):
+    """mdx2 apply: scale = a b d, offset = c / b (numpy semantics for b = 0)."""
+    n = scale.size
+    for c in nb.prange(nchunk):
+        for i in range(n * c // nchunk, n * (c + 1) // nchunk):
+            scale[i] = va[i] * vb[i] * vd[i]
+            offset[i] = vc[i] / vb[i]
+
+
+@nb.njit(parallel=True, cache=True, error_model="numpy")
 def k_merge(gstart, order, mask, I, sigma, scale, offset, Im, sigm, counts):
     """mdx2 ScaledData.merge: I' = I/scale - offset, sigma' = sigma/scale, inverse-variance mean per group."""
     G = gstart.size - 1
@@ -224,7 +234,7 @@ def k_merge(gstart, order, mask, I, sigma, scale, offset, Im, sigm, counts):
             sigm[h] = np.nan
 
 
-@nb.njit(parallel=True, cache=True)
+@nb.njit(parallel=True, cache=True, error_model="numpy")
 def k_outliers(mask, I, sigma, ih, Im, scale, offset, nsigma, nchunk):
     """mdx2: resid = (scale (Im + offset) - I)/sigma > nsigma (one-sided); masks them, returns the count."""
     n = mask.size
@@ -324,7 +334,11 @@ class FastScaledData:
         G = self._ihmax + 1
         self._order = np.argsort(self._ih, kind="stable")
         self._gstart = np.searchsorted(self._ih[self._order], np.arange(G + 1)).astype(np.int64)
-        self.nchunk = nb.get_num_threads()
+
+    @property
+    def nchunk(self):
+        """Work chunks for the kernels: numba's current thread count (set by mdx2.scale after loading)."""
+        return nb.get_num_threads()
 
     def __len__(self):
         return len(self._I)
@@ -477,9 +491,7 @@ class FastBatchModelRefiner:
 
     def apply(self):
         v = self.vals
-        with np.errstate(divide="ignore", invalid="ignore"):
-            np.multiply(v["a"] * v["b"], v["d"], out=self.data.scale)
-            np.divide(v["c"], v["b"], out=self.data.offset)
+        k_apply(v["a"], v["b"], v["c"], v["d"], self.data.scale, self.data.offset, self.data.nchunk)
 
     def _fit(self, kind, t, Im, alphas, ridge=None):
         D, v, g = self.data, self.vals, t.grid

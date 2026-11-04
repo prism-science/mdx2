@@ -337,12 +337,11 @@ def run_scale(params):
 
     profiling.PROFILER = P = profiling.Profiler(params.profile, params.profile_file)
 
-    if params.engine == "fast":
-        _set_threads(params.nproc)
-
     S = load_data_for_scaling(*params.hkl, engine=params.engine)
 
     if params.engine == "fast":
+        # threads start after loading and grouping (plain numpy), just before the first kernel
+        _set_threads(params.nproc)
         from mdx2.fast_scaling import FastBatchModelRefiner  # noqa: PLC0415 (numba is optional)
 
         MR = FastBatchModelRefiner(S)
