@@ -134,7 +134,9 @@ def test_merge_matches_reference(tmp_path, opts, nthreads):
     numba.set_num_threads(nthreads or numba.config.NUMBA_NUM_THREADS)
     hkl_files, scale_files = write_inputs(tmp_path)
     outfile = str(tmp_path / "merged.nxs")
-    params = Parameters(hkl=hkl_files, scale=scale_files, outfile=outfile, nproc=nthreads or -1, **opts)
+    params = Parameters(
+        hkl=hkl_files, scale=scale_files, outfile=outfile, nproc=nthreads or -1, outlier_method="legacy", **opts
+    )
     np.random.seed(7)
     (h, k, l), ref = reference_merge(params)
     np.random.seed(7)

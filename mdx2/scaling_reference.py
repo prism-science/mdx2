@@ -153,7 +153,9 @@ class ScaledData:
         self.mask[is_singleton] = True  # apply singleton masks
         return is_singleton.sum()
 
-    def mask_outliers(self, Im, nsigma):
+    def mask_outliers(self, Im, nsigma, method="legacy"):
+        if method != "legacy":
+            raise ValueError("the reference engine only implements the legacy outlier rejection")
         resid = (self.scale * (Im[self._ih] + self.offset) - self._I) / self._sigma
         isoutlier = (resid > nsigma) & ~(self.mask)
         self.mask[isoutlier] = True  # apply outlier masks

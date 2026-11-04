@@ -79,5 +79,5 @@ def test_scaling_matches_reference(nthreads):
     for MR in (ref, fast):
         MR.apply()
     n_ref = ref.data.mask_outliers(ref.data.merge()[0], 3.0)
-    n_fast = fast.data.mask_outliers(fast.data.merge()[0], 3.0)
+    n_fast = fast.data.mask_outliers(fast.data.merge()[0], 3.0, method="legacy")
     assert n_fast == n_ref

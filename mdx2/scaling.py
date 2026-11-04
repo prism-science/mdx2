@@ -25,6 +25,7 @@ from mdx2._scaling_kernels import (
     k_merge,
     k_normal,
     k_outliers,
+    k_outliers_loo,
     k_split_half,
     k_values,
 )
@@ -708,8 +709,38 @@ class ScaledData:
         )
         return out
 
-    def mask_outliers(self, Im, nsigma):
-        return int(
+    def mask_outliers(self, Im, nsigma, method="two_sided"):
+        """Mask outliers; returns how many.
+
+        "two_sided": per group, the observation with the largest leave-one-out residual |r| (against the weighted
+        mean of the others, with both variances) if |r| > nsigma; both observations of a pair. At most one per group
+        per call (Im unused: sums from the current scale and offset). Counts above / below the others' mean in
+        self.last_outliers.
+        "legacy" (mdx2 <= 1.0.5): (scale (Im + offset) - I) / sigma > nsigma, i.e. observations below the merged
+        value only, all in one pass.
+        """
+        if method == "two_sided":
+            G = self._ihmax + 1
+            nhigh, nlow = np.empty(G, dtype=np.int64), np.empty(G, dtype=np.int64)
+            before = self.count()
+            k_outliers_loo(
+                self._gstart,
+                self._order,
+                self.mask,
+                self._I,
+                self._sigma,
+                self.scale,
+                self.offset,
+                float(nsigma),
+                nhigh,
+                nlow,
+            )
+            n = before - self.count()
+            self.last_outliers = dict(high=int(nhigh.sum()), low=int(nlow.sum()), total=n)
+            return n
+        if method != "legacy":
+            raise ValueError(f"Unknown outlier method {method!r} (use 'two_sided' or 'legacy')")
+        n = int(
             k_outliers(
                 self.mask,
                 self._I,
@@ -722,6 +753,8 @@ class ScaledData:
                 self.nchunk,
             )
         )
+        self.last_outliers = dict(high=0, low=n, total=n)
+        return n
 
     def count(self, sl=slice(None)):
         return int(np.count_nonzero(~self.mask[sl]))

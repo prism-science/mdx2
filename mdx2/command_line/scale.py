@@ -90,6 +90,10 @@ class Parameters:
     engine: str = "fast"
     """scaling engine: "fast" (default; compiled multi-threaded mdx2.scaling) or "reference" (the slower
     implementation of mdx2 <= 1.0.5, mdx2.scaling_reference; same algorithm, kept for one release)"""
+    outlier_method: str = "two_sided"
+    """outlier rejection after each stage: "two_sided" (default; per symmetry-equivalent group, the observation with
+    the largest leave-one-out residual if beyond the cutoff, both observations of a disagreeing pair) or "legacy"
+    (mdx2 <= 1.0.5: observations below the merged value only; always used by the reference engine)"""
     profile: bool = False  # log a summary of wall time and memory per step (load, apply, merge, fit, ...)
     profile_file: Optional[str] = None  # write wall time and memory per step to this file (JSON lines)
     mca2020: bool = False
@@ -109,6 +113,8 @@ class Parameters:
         # But truly duplicate paths are not allowed (e.g., data.nxs, data.nxs)
         if self.engine not in ("fast", "reference"):
             raise ValueError(f"Unknown engine {self.engine!r} (use 'fast' or 'reference')")
+        if self.outlier_method not in ("two_sided", "legacy"):
+            raise ValueError(f"Unknown outlier_method {self.outlier_method!r} (use 'two_sided' or 'legacy')")
         if len(self.hkl) != len(set(self.hkl)):
             raise ValueError("Duplicate input files are not allowed")
 
@@ -154,14 +160,25 @@ def generate_default_outfiles(infiles):
     return None
 
 
-def mask_outliers(MR, outlier):
+def mask_outliers(MR, outlier, method="legacy"):
     """Mask outliers"""
     logger.info("    Applying scale factors...")
     MR.apply()
-    logger.info("    Merging...")
-    Im, _sigmam, _counts = MR.data.merge()
-    nout = MR.data.mask_outliers(Im, outlier)
-    logger.info("    Removed {} outliers (>{} sigma)", nout, outlier)
+    if method == "legacy":
+        logger.info("    Merging...")
+        Im, _sigmam, _counts = MR.data.merge()
+        nout = MR.data.mask_outliers(Im, outlier, method="legacy")
+        logger.info("    Removed {} outliers (>{} sigma)", nout, outlier)
+    else:
+        nout = MR.data.mask_outliers(None, outlier, method=method)
+        o = MR.data.last_outliers
+        logger.info(
+            "    Removed {} outliers (|leave-one-out residual| >{} sigma; {} high, {} low)",
+            nout,
+            outlier,
+            o["high"],
+            o["low"],
+        )
 
 
 def refine_offset_model(MR, offset_params):
@@ -321,7 +338,7 @@ def run_scale(params):
     if params.engine == "reference":
         from mdx2.scaling_reference import BatchModelRefiner  # noqa: PLC0415
 
-        logger.info("Reference engine (single-threaded)")
+        logger.info("Reference engine (single-threaded, legacy outlier rejection)")
     else:
         from mdx2.parallel import set_threads  # noqa: PLC0415
         from mdx2.scaling import BatchModelRefiner  # noqa: PLC0415
@@ -329,6 +346,7 @@ def run_scale(params):
         set_threads(params.nproc)  # threads start after loading and grouping (plain numpy), before the first kernel
     MR = BatchModelRefiner(S)
     _instrument(MR, P)
+    outlier_method = "legacy" if params.engine == "reference" else params.outlier_method
 
     if params.scaling.enable:
         MR.add_scaling_models(
@@ -357,31 +375,31 @@ def run_scale(params):
         logger.info("Optimizing scale vs. phi (b)...")
         P.stage = "b"
         refine_scaling_model(MR, params.scaling)
-        mask_outliers(MR, params.scaling.outlier)
+        mask_outliers(MR, params.scaling.outlier, outlier_method)
 
     if params.scaling.enable and params.offset.enable:
         logger.info("Optimizing scaling and offset models together (b,c)...")
         P.stage = "b,c"
         refine_scaling_and_offset_model(MR, params.scaling, params.offset)
-        mask_outliers(MR, params.offset.outlier)
+        mask_outliers(MR, params.offset.outlier, outlier_method)
 
     if params.offset.enable:
         logger.info("Optimizing offset vs. phi and resolution (c)...")
         P.stage = "c"
         refine_offset_model(MR, params.offset)
-        mask_outliers(MR, params.offset.outlier)
+        mask_outliers(MR, params.offset.outlier, outlier_method)
 
     if params.detector.enable:
         logger.info("Optimizing scale vs. detector position (d)...")
         P.stage = "d"
         refine_detector_model(MR, params.detector)
-        mask_outliers(MR, params.detector.outlier)
+        mask_outliers(MR, params.detector.outlier, outlier_method)
 
     if params.absorption.enable:
         logger.info("Optimizing scale vs. detector position and phi (a)...")
         P.stage = "a"
         refine_absorption_model(MR, params.absorption)
-        mask_outliers(MR, params.absorption.outlier)
+        mask_outliers(MR, params.absorption.outlier, outlier_method)
 
     logger.info("Refinement completed")
 

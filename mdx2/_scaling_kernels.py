@@ -244,3 +244,68 @@ def k_split_half(gstart, order, jitter, w, flips, out):
             if t > 0:
                 acc += w[srt[t]]
             out[srt[t]] = (acc > 0.5 * tot) != f
+
+
+@nb.njit(parallel=True, cache=True, error_model="numpy")
+def k_outliers_loo(gstart, order, mask, I, sigma, scale, offset, nsigma, nhigh, nlow):
+    """Two-sided leave-one-out outlier rejection, at most one observation per group per call.
+
+    Per group (unmasked observations, x = I/scale - offset, w = (scale/sigma)^2, W = sum w): the residual of
+    observation i against the weighted mean of the others, r_i = (x_i - Im_{-i}) / sqrt(1/w_i + 1/(W - w_i)), which is
+    the inclusive residual (x_i - Im) sqrt(w_i) divided by sqrt(1 - w_i/W). The observation with the largest |r_i|
+    is masked if |r_i| > nsigma; in a group of two (equal |r|), both are masked. Groups of one are left alone.
+    Per-group counts of masked observations above (nhigh) and below (nlow) the others' mean.
+    """
+    G = gstart.size - 1
+    for h in nb.prange(G):
+        a, b = gstart[h], gstart[h + 1]
+        nhigh[h] = 0
+        nlow[h] = 0
+        W = 0.0
+        S = 0.0
+        m = 0
+        for t in range(a, b):
+            i = order[t]
+            if not mask[i]:
+                sc = scale[i]
+                sp = np.float64(sigma[i]) / sc
+                wi = 1.0 / (sp * sp)
+                W += wi
+                S += wi * (np.float64(I[i]) / sc - offset[i])
+                m += 1
+        if m < 2:
+            continue
+        worst = -1
+        rmax = 0.0
+        rsign = 0.0
+        for t in range(a, b):
+            i = order[t]
+            if mask[i]:
+                continue
+            sc = scale[i]
+            sp = np.float64(sigma[i]) / sc
+            wi = 1.0 / (sp * sp)
+            xi = np.float64(I[i]) / sc - offset[i]
+            Wr = W - wi
+            if not (Wr > 0.0):
+                continue
+            r = (xi - (S - wi * xi) / Wr) / math.sqrt(sp * sp + 1.0 / Wr)
+            if abs(r) > rmax:
+                rmax = abs(r)
+                rsign = r
+                worst = i
+        if worst < 0 or not (rmax > nsigma):
+            continue
+        if m == 2:  # the two residuals are equal and opposite: no way to tell which is wrong
+            for t in range(a, b):
+                i = order[t]
+                if not mask[i]:
+                    mask[i] = True
+            nhigh[h] = 1
+            nlow[h] = 1
+        else:
+            mask[worst] = True
+            if rsign > 0:
+                nhigh[h] = 1
+            else:
+                nlow[h] = 1

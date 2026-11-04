@@ -25,6 +25,10 @@ class Parameters:
     hkl: List[str] = field(positional=True, nargs="+")  # NeXus file(s) containing hkl_table
     scale: List[str] = field(nargs="+")  # NeXus file(s) with scaling models
     outlier: Optional[float] = None  # optional standard error cutoff for outlier rejection
+    outlier_method: str = "two_sided"
+    """"two_sided" (default; per symmetry-equivalent group, the observation with the largest leave-one-out residual,
+    repeated until none is beyond the cutoff; both observations of a disagreeing pair) or "legacy" (mdx2 <= 1.0.5:
+    observations below the merged value only, one pass)"""
     split: Optional[str] = field(default=None, choices=["randomHalf", "weightedRandomHalf", "Friedel"])
     """also merge data into separate columns based on splitting criteria"""
     geometry: Optional[str] = (
@@ -46,6 +50,8 @@ class Parameters:
         """Validate inter-parameter dependencies and outlier parameter"""
         if self.split == "Friedel" and self.geometry is None:
             raise ValueError("--geometry argument is required for symmetry-based splitting")
+        if self.outlier_method not in ("two_sided", "legacy"):
+            raise ValueError(f"Unknown outlier_method {self.outlier_method!r} (use 'two_sided' or 'legacy')")
         if self.outlier is not None and self.outlier <= 0:
             raise ValueError(f"outlier must be > 0, got {self.outlier}")
         if len(self.scale) != len(self.hkl):
@@ -109,9 +115,28 @@ def run_merge(params):
         Im, sigmam, counts = S.merge()
 
     if params.outlier is not None:
-        with P.step("mask_outliers"):
-            nout = S.mask_outliers(Im, params.outlier)
-        logger.info("Removed {} outliers (>{} sigma)", nout, params.outlier)
+        with P.step("mask_outliers", method=params.outlier_method):
+            if params.outlier_method == "legacy":
+                nout = S.mask_outliers(Im, params.outlier, method="legacy")
+                logger.info("Removed {} outliers (>{} sigma)", nout, params.outlier)
+            else:
+                nout = high = low = rounds = 0
+                while True:  # at most one per group per round
+                    n = S.mask_outliers(None, params.outlier)
+                    if n == 0:
+                        break
+                    rounds += 1
+                    nout += n
+                    high += S.last_outliers["high"]
+                    low += S.last_outliers["low"]
+                logger.info(
+                    "Removed {} outliers (|leave-one-out residual| >{} sigma; {} high, {} low; {} round(s))",
+                    nout,
+                    params.outlier,
+                    high,
+                    low,
+                    rounds,
+                )
         logger.info("Merging again...")
         with P.step("merge"):
             Im, sigmam, counts = S.merge()
