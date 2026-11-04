@@ -33,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=6.0"]
-fast = ["numba", "psutil"]  # mdx2.scale --engine fast; psutil for --profile memory (optional)
+fast = ["numba", "psutil", "threadpoolctl"]  # mdx2.scale --engine fast; psutil: --profile memory
 dev = ["ruff>=0.1.0", "pytest>=6.0"]
 
 [project.urls]
