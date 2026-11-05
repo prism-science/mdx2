@@ -1,8 +1,12 @@
+import math
 import re
 
+import h5py
+import hdf5plugin  # noqa: F401  (HDF5 filters for detector data, e.g. bitshuffle, in NXmxFrameReader)
 import numpy as np
 from cctbx.eltbx import attenuation_coefficient
 from dxtbx import flumpy
+from dxtbx.format.FormatNXmx import FormatNXmx
 from dxtbx.format.FormatPilatusHelpers import sensor_active_areas
 from dxtbx.model.experiment_list import ExperimentList
 from scitbx import matrix
@@ -352,12 +356,173 @@ class ImageSet:
         return image
 
     def read_stack(self, start, stop):
-        stack = []
-        # read the rest of the frames
-        for ind in range(start, stop):
-            stack.append(self.read_frame(ind))
+        ny, nx = self.frame_shape
+        stack = np.empty((stop - start, ny, nx), dtype=np.int32)  # filled in place (no list + np.stack copy)
+        for i, ind in enumerate(range(start, stop)):
+            stack[i] = self.read_frame(ind)
+        return stack
 
-        return np.stack(stack)
+    def direct_reader(self):
+        """A NXmxFrameReader for this image set, or (None, reason) if it does not apply."""
+        return NXmxFrameReader.from_imageset(self._iset)
+
+
+def _open_hdf5(path, work, keep_open=False):
+    """Open an HDF5 file read-only and return (file, work(file)), with the SWMR flag of any handle already open on the
+    same file in this process: HDF5 refuses a second open with a different flag, which shows up when following links
+    to the data files. dxtbx opens NXmx files with swmr=True (FormatNXmx); we don't assume it."""
+    error = None
+    for swmr in (True, False):
+        f = None
+        try:
+            f = h5py.File(path, "r", swmr=swmr)
+            result = work(f)
+            if not keep_open:
+                f.close()
+            return f, result
+        except (OSError, KeyError) as e:
+            if f is not None:
+                f.close()
+            if "SWMR" not in str(e):
+                raise
+            error = e
+    raise error
+
+
+class NXmxFrameReader:
+    """Reads frames of an NXmx (e.g. Eiger) image set with h5py and applies the dxtbx mask in numpy.
+
+    Same result as ImageSet.read_frame (int32, masked pixels -1) for formats where dxtbx's mask is the static mask
+    (from the format and the experiment's external lookup) and the panel's trusted range, inclusive at both ends, as
+    dxtbx.model.Panel.get_trusted_range_mask. dxtbx's per-frame overhead (flex arrays, mask objects) is ~2.5x the
+    decompression time on Eiger 16M. Picklable (file handles are opened in each process on first use), and needs only
+    h5py in the workers: import_data checks it against dxtbx once, in the main process (check_against).
+    """
+
+    def __init__(self, master, links, counts, indices, frame_shape, trusted_range, static_mask):
+        self.master = master
+        self.links = links  # entry/data/data_NNNNNN paths in the master file, in frame order
+        self.starts = np.concatenate([[0], np.cumsum(counts)])
+        self.indices = np.asarray(indices)  # image-set index -> frame index in the data files
+        self.frame_shape = frame_shape
+        self.trusted_range = trusted_range
+        self.static_mask = static_mask  # bool (ny, nx), True = valid; or None
+        self._datasets = None
+        self._file = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_datasets"] = None
+        state["_file"] = None
+        return state
+
+    def close(self):
+        if self._file is not None:
+            self._file.close()
+        self._file = self._datasets = None
+
+    @staticmethod
+    def from_imageset(iset):
+        """(reader, None) if the direct reader applies to this dxtbx image set, else (None, reason)."""
+        fmt = iset.get_format_class()
+        if fmt is None or not issubclass(fmt, FormatNXmx):
+            return None, f"format {getattr(fmt, '__name__', fmt)} is not NXmx"
+        paths = list(iset.paths())
+        if len(set(paths)) != 1:
+            return None, "more than one file"
+        if iset.has_dynamic_mask():
+            return None, "dynamic mask"
+        detector = iset.get_detector()
+        if len(detector) != 1:
+            return None, "multi-panel detector"
+        panel = detector[0]
+        nx, ny = panel.get_image_size()
+
+        def layout(f):
+            if "entry/data" not in f:
+                return "no entry/data group"
+            links = sorted(k for k in f["entry/data"] if re.fullmatch(r"data_\d{6}", k))
+            if not links:
+                return "no data_NNNNNN datasets"
+            shapes = [(k, f["entry/data"][k].shape, f["entry/data"][k].dtype) for k in links]
+            return links, shapes
+
+        _, found = _open_hdf5(paths[0], layout)
+        if isinstance(found, str):
+            return None, found
+        links, shapes = found
+        counts, dtypes = [], set()
+        for k, shape, dt in shapes:
+            if len(shape) != 3 or shape[1:] != (ny, nx):
+                return None, f"{k} has shape {shape}, panel is {(ny, nx)}"
+            counts.append(shape[0])
+            dtypes.add(dt)
+        if len(dtypes) != 1 or not np.issubdtype(next(iter(dtypes)), np.integer):
+            return None, f"data types {dtypes}"
+        dtype = next(iter(dtypes))
+        lo, hi = panel.get_trusted_range()
+        # dxtbx maps the top two values of the readout to -1 / -2 and reads 32-bit data as signed: the same pixels are
+        # masked here only if those values are outside the trusted range
+        top = 2**31 if dtype.itemsize >= 4 else 2 ** (8 * dtype.itemsize)
+        if lo < 0 or hi >= top - 2:
+            return None, f"trusted range {(lo, hi)} overlaps dxtbx's special values"
+        indices = list(iset.indices())
+        if max(indices) >= sum(counts):
+            return None, "image indices beyond the data files"
+        static = None
+        masks = []
+        instance = fmt.get_instance(paths[0])
+        fmask = instance.get_static_mask()
+        if fmask is not None:
+            masks.append(fmask[0].as_numpy_array())
+        ext = iset.external_lookup.mask
+        if ext.data is not None and not ext.data.empty():
+            masks.append(ext.data.tile(0).data().as_numpy_array())
+        if masks:
+            static = np.logical_and.reduce(masks)
+        return NXmxFrameReader(paths[0], links, counts, indices, (ny, nx), (lo, hi), static), None
+
+    def _open(self):
+        self._file, self._datasets = _open_hdf5(
+            self.master, lambda f: [f["entry/data"][k] for k in self.links], keep_open=True
+        )
+        dtype = self._datasets[0].dtype
+        info = np.iinfo(dtype)
+        lo, hi = self.trusted_range
+        # integer bounds (dxtbx compares in double precision; the same for integer values)
+        self.lo = dtype.type(max(math.ceil(lo), info.min))
+        self.hi = dtype.type(min(math.floor(hi), info.max))
+        self._buf = np.empty(self.frame_shape, dtype=dtype)
+
+    def read_raw(self, ind):
+        """Frame ind of the image set as stored (no mask applied; the buffer is reused by the next call).
+        Valid pixels: lo <= value <= hi and static_mask (if not None)."""
+        if self._datasets is None:
+            self._open()
+        g = int(self.indices[ind])
+        k = int(np.searchsorted(self.starts, g, side="right")) - 1
+        self._datasets[k].read_direct(self._buf, np.s_[g - self.starts[k]])
+        return self._buf
+
+    def read_frame(self, ind, out=None):
+        """Frame ind of the image set as int32 with masked pixels -1 (as ImageSet.read_frame)."""
+        v = self.read_raw(ind)
+        invalid = (v < self.lo) | (v > self.hi)
+        if self.static_mask is not None:
+            invalid |= ~self.static_mask
+        if out is None:
+            out = np.empty(self.frame_shape, dtype=np.int32)
+        np.copyto(out, v, casting="unsafe")  # valid values are within the trusted range, so they fit int32
+        np.putmask(out, invalid, -1)
+        return out
+
+    def check_against(self, imageset):
+        """Compare the first frame with ImageSet.read_frame (dxtbx). Returns None if identical, else a description."""
+        ref = imageset.read_frame(0)
+        mine = self.read_frame(0)
+        if not np.array_equal(ref, mine):
+            return f"frame 0: {int(np.sum(ref != mine))} pixels differ"
+        return None
 
 
 def calc_rotation_matrix_at_phi(goniometer, phi_vals_deg):
