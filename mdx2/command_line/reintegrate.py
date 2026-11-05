@@ -293,7 +293,8 @@ def run_reintegrate(params):
     if params.engine == "reference":
         slices = list(image_series.chunk_slice_iterator())
         logger.info("Reintegrating {} image chunks (requested n_jobs: {})...", len(slices), params.nproc)
-        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
+        # results in submission order: the float32 sums do not depend on which task finishes first
+        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator") as parallel:
             log_parallel_backend(parallel)
             tab_chunk = parallel(delayed(intchunk)(sl) for sl in slices)
             for tab in tab_chunk:
@@ -318,7 +319,9 @@ def run_reintegrate(params):
 
         t0 = time.perf_counter()
         timers = []
-        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
+        # results in submission order (all are kept until the grid is sized anyway): the float32 sums are then
+        # reproducible from run to run
+        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator") as parallel:
             log_parallel_backend(parallel)
             # each task carries only its part of the Miller-index grid
             tasks = (delayed(intcolumn)(c, MillerIndexRegion.for_column(miller_index, c)) for c in columns)

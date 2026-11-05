@@ -68,6 +68,23 @@ def test_reintegrate_engines(sweep, output):
             np.testing.assert_allclose(x, y, rtol=2e-6, equal_nan=True, err_msg=c)
 
 
+@pytest.mark.parametrize("engine", ["reference", "fast"])
+def test_reintegrate_reproducible(sweep, engine):
+    """Task results are accumulated in submission order: serial and parallel runs give bit-identical sums."""
+    tmp_path, geom, dat, pk = sweep
+    _, fd = make_masks(tmp_path, geom, dat, pk)
+    tabs = []
+    for nproc in (1, 3):
+        out = str(tmp_path / f"reint_{engine}_{nproc}.nxs")
+        run_reintegrate(ReintParams(geom=geom, data=dat, mask=fd, subdivide=(2, 2, 2), output="intensity", outfile=out,
+                                    engine=engine, nproc=nproc))  # fmt: skip
+        tabs.append(loadobj(out, "hkl_table"))
+    a, b = tabs
+    assert len(a) == len(b) > 0
+    for c in ["h", "k", "l"] + sorted(a._data_keys):
+        np.testing.assert_array_equal(getattr(a, c), getattr(b, c), err_msg=c)
+
+
 def integrate(sweep, engine, name):
     tmp_path, geom, dat, pk = sweep
     _, fd = make_masks(tmp_path, geom, dat, pk)
