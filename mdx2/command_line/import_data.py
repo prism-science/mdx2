@@ -27,6 +27,9 @@ class Parameters:
     logfile: str = "mdx2.import_data.log"  # name of the log file
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
     datastore: str = "datastore"  # folder for storing source datasets
+    compression: str = field(default="blosc-lz4", choices=["blosc-lz4", "blosc-zstd", "gzip"])
+    """datastore compression: blosc-lz4 (default; fast to read and write), blosc-zstd (~20% smaller, slower to
+    write), gzip (gzip-1 + shuffle, as mdx2 <= 1.0.5). Blosc needs the hdf5plugin filters wherever the data is read."""
 
 
 def run_import_data(params):
@@ -37,7 +40,8 @@ def run_import_data(params):
     datastore = params.datastore
 
     logger.info("Loading experiment metadata...")
-    image_series = ImageSeries.from_expt(exptfile)
+    image_series = ImageSeries.from_expt(exptfile, compression=params.compression)
+    logger.info("Datastore compression: {}", params.compression)
     iset = ImageSet.from_file(exptfile)
     logger.info("Image data shape (phi, iy, ix): {}", image_series.shape)
 
