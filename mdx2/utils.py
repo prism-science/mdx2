@@ -21,7 +21,7 @@ def __getattr__(name):
     io_functions = ["nxload", "nxsave", "loadobj", "saveobj"]
     if name in io_functions:
         _deprecated_import(name)
-        from mdx2 import io
+        from mdx2 import io  # noqa: PLC0415 (imported only on deprecated access)
 
         return getattr(io, name)
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
@@ -36,10 +36,10 @@ __all__ = [
     "interp2",
     "slice_sections",
     # I/O functions (deprecated, imported from mdx2.io)
-    "nxload",
-    "nxsave",
-    "loadobj",
-    "saveobj",
+    "nxload",  # noqa: F822 (provided by __getattr__)
+    "nxsave",  # noqa: F822 (provided by __getattr__)
+    "loadobj",  # noqa: F822 (provided by __getattr__)
+    "saveobj",  # noqa: F822 (provided by __getattr__)
 ]
 
 

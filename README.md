@@ -108,6 +108,13 @@ pip install -e ".[dev]"
 
 The last line installs mdx2 in editable mode, with optional development tools including pytest and ruff.
 
+CI runs the tests and ruff (pinned in the `dev` extra; notebooks are excluded). Before pushing:
+
+```bash
+ruff check . && ruff format --check .
+pytest -q
+```
+
 ## References
 
 Publications describing [ando-lab/mdx2](https://github.com/ando-lab/mdx2):

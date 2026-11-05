@@ -587,7 +587,9 @@ class _Grid:
     def __init__(self, axes):
         # axes may be float32 (numpy >= 2 keeps float32 through np.linspace when the limits come from float32 data):
         # judge uniformity at the precision the axis was stored in
-        eps = [np.finfo(np.asarray(a).dtype).eps if np.issubdtype(np.asarray(a).dtype, np.floating) else 0.0 for a in axes]
+        eps = [
+            np.finfo(np.asarray(a).dtype).eps if np.issubdtype(np.asarray(a).dtype, np.floating) else 0.0 for a in axes
+        ]
         self.axes = [np.asarray(a, dtype=np.float64) for a in axes]
         for a, e in zip(self.axes, eps):
             assert a.size >= 2, "mdx2 interpolation needs at least two control points per axis"

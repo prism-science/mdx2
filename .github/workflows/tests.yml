@@ -1,4 +1,5 @@
-# Unit tests (pytest) on Linux and macOS.
+# Lint (ruff check + ruff format --check; notebooks excluded in pyproject.toml) and unit tests (pytest) on Linux
+# and macOS.
 # Runs on pull requests (all branches), on pushes to dev (the pre-release branch), and manually (Actions tab ->
 # tests -> Run workflow). A newer push to the same PR or branch cancels the run in progress.
 name: tests
@@ -16,6 +17,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff (same version as the dev extra in pyproject.toml)
+        run: pip install ruff==0.14.8
+      - name: ruff check
+        run: ruff check --output-format=github .
+      - name: ruff format --check
+        run: ruff format --check --diff .
+
   pytest:
     strategy:
       fail-fast: false
