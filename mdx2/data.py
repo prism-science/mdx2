@@ -513,11 +513,18 @@ class ImageSeries:
         return (self.phi.size, self.iy.size, self.ix.size)
 
     def __getitem__(self, sl):
+        sub = self.data[sl]
+        data = self._as_np(sub)  # force a read and set to numpy array
+        if isinstance(sub, NXfield):
+            # the temporary NXfield and its attribute dict reference each other: drop its reference to the data, so
+            # the array is freed with this ImageSeries rather than at the next cyclic garbage collection (otherwise
+            # each chunk read stays in memory for a while: GBs per worker for large detectors)
+            sub._value = None
         return ImageSeries(
             self.phi[sl[0]],
             self.iy[sl[1]],
             self.ix[sl[2]],
-            self._as_np(self.data[sl]),  # force a read and set to numpy array
+            data,
             self.exposure_times[sl[0]],
         )
 

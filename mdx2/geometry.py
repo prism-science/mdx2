@@ -553,7 +553,10 @@ class StaticMask:
         self.signal = signal  # NXfield; pickles as a reference to the file, so workers read only their chunk
 
     def for_chunk(self, sl):
-        return self.signal[sl].nxdata
+        sub = self.signal[sl]
+        data = sub.nxdata
+        sub._value = None  # break the NXfield / AttrDict reference cycle's hold on the array (see ImageSeries)
+        return data
 
     def check_axes(self, phi, iy, ix):
         if tuple(self.signal.shape) != (len(phi), len(iy), len(ix)):
