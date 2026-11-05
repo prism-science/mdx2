@@ -12,6 +12,7 @@ from joblib import Parallel, delayed
 from loguru import logger
 from simple_parsing import field
 
+from mdx2 import profiling
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.geometry import load_mask
@@ -73,7 +74,8 @@ def integrate_column(image_series, slices, miller_index, mask, ndiv, max_degrees
     """Fast-engine task: bin every chunk of one column (one detector module), group within the column.
     Returns (DataFrame or None, number of partial rows, seconds per step)."""
     timer = {}
-    tabs = [t for t in (bin_chunk(image_series, sl, miller_index, mask, ndiv, timer=timer) for sl in slices) if t]
+    tabs = [bin_chunk(image_series, sl, miller_index, mask, ndiv, timer=timer) for sl in slices]
+    tabs = [t for t in tabs if t is not None]
     if not tabs:
         return None, 0, timer
     t0 = time.perf_counter()
@@ -92,9 +94,13 @@ def run_integrate(params):
     max_degrees = params.max_spread
     maskfile = params.mask
 
+    P = profiling.PROFILER = profiling.Profiler(params.profile)
+    clock = time.perf_counter
+    t0 = clock()
     logger.info("Loading geometry and image data...")
     MI = loadobj(geom, "miller_index")
     IS = loadobj(data, "image_series")
+    P.add("load", clock() - t0)
 
     if maskfile is not None:
         logger.info("Loading mask...")
@@ -114,9 +120,11 @@ def run_integrate(params):
 
         slices = list(IS.chunk_slice_iterator())
         logger.info("Integrating {} image chunks (requested n_jobs: {})...", len(slices), nproc)
+        t0 = clock()
         with Parallel(n_jobs=nproc, verbose=10) as parallel:
             log_parallel_backend(parallel)
             T = parallel(delayed(intchunk)(sl) for sl in slices)
+        P.add("tasks", clock() - t0)
         logger.info("Integration completed")
         logger.info("Summing partial observations over {} chunks...", len(T))
         if not T:
@@ -124,8 +132,10 @@ def run_integrate(params):
                 "No integration results produced. The image series may be empty, or no valid data was found to "
                 "integrate."
             )
+        t0 = clock()
         df = group_partials(T, max_degrees)
         voxels_before = np.sum([len(t) for t in T])
+        P.add("group (parent)", clock() - t0)
     else:
         columns = chunk_columns(IS)
         logger.info(
@@ -151,13 +161,17 @@ def run_integrate(params):
                 "No integration results produced. The image series may be empty, or no valid data was found to "
                 "integrate."
             )
+        P.add("tasks", wall)
         log_timers([r[2] for r in results], wall, params.profile)
+        t0 = clock()
         df = pd.concat(frames)
         voxels_before = sum(r[1] for r in results)
+        P.add("concatenate", clock() - t0)
 
     voxels_after = len(df)
     logger.info("Binned from {} to {} voxels", voxels_before, voxels_after)
 
+    t0 = clock()
     hkl_table = HKLTable.from_frame(df)
     hkl_table.ndiv = ndiv  # lost in conversion to/from dataframe
 
@@ -171,8 +185,12 @@ def run_integrate(params):
     hkl_table.counts = hkl_table.counts.astype(np.int32)
     hkl_table.pixels = hkl_table.pixels.astype(np.int32)
 
+    P.add("to table", clock() - t0)
+    t0 = clock()
     logger.info("Saving integrated data to {}...", outfile)
     saveobj(hkl_table, outfile, name="hkl_table", append=False)
+    P.add("save", clock() - t0)
+    P.summary()
     logger.info("Integration completed successfully")
 
 

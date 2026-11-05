@@ -222,6 +222,9 @@ def reintegrate_column(
 
 
 def run_reintegrate(params):
+    P = profiling.PROFILER = profiling.Profiler(params.profile)
+    clock = time.perf_counter
+    t_load = clock()
     logger.info("Loading geometry and image data...")
     miller_index = loadobj(params.geom, "miller_index")
     image_series = loadobj(params.data, "image_series")
@@ -260,6 +263,8 @@ def run_reintegrate(params):
 
     # TODO: check for memory limitations, consider using memory mapping for large datasets
 
+    P.add("load", clock() - t_load)
+    t_grid = clock()
     logger.info("Calculating Miller index range for output grid...")
     hkl = HKLTable(miller_index.h.ravel(), miller_index.k.ravel(), miller_index.l.ravel(), ndiv=params.subdivide)
     hkl = hkl.to_asu(symmetry)
@@ -276,6 +281,8 @@ def run_reintegrate(params):
     }
     grid = HKLGrid(data_arrays, ndiv=params.subdivide, ori=array_ori)
 
+    P.add("grid setup", clock() - t_grid)
+    t_tasks = clock()
     if params.engine == "reference":
         slices = list(image_series.chunk_slice_iterator())
         logger.info("Reintegrating {} image chunks (requested n_jobs: {})...", len(slices), params.nproc)
@@ -314,6 +321,8 @@ def run_reintegrate(params):
         log_timers(timers, time.perf_counter() - t0, params.profile)
     logger.info("Reintegration completed")
 
+    P.add("tasks + accumulate", clock() - t_tasks)
+    t_tab = clock()
     logger.info("Converting grid to sparse table...")
     hkl_table = grid.to_table(sparse=True)
     hkl_table.h = hkl_table.h.astype(np.float32)
@@ -332,8 +341,12 @@ def run_reintegrate(params):
         hkl_table.intensity = hkl_table.intensity.astype(np.float32)
         hkl_table.intensity_error = hkl_table.intensity_error.astype(np.float32)
 
+    P.add("to table + intensity", clock() - t_tab)
+    t_save = clock()
     logger.info("Saving reintegrated data to {}...", params.outfile)
     saveobj(hkl_table, params.outfile, name="hkl_table", append=False)
+    P.add("save", clock() - t_save)
+    P.summary()
     logger.info("Reintegration completed successfully")
 
 
