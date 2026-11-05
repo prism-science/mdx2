@@ -470,6 +470,13 @@ def index_grid_to_lab(panel, ix, iy):
     return x, y, z
 
 
+def pixels_to_lab(panel, ix, iy):
+    """Lab coordinates (n, 3) of points given in pixel coordinates (as index_grid_to_lab, but not on a grid)."""
+    xy = flumpy.vec_from_numpy(np.ascontiguousarray(np.stack([ix, iy], axis=-1), dtype=np.double))
+    xyz = panel.get_lab_coord(panel.pixel_to_millimeter(xy))
+    return xyz.as_numpy_array().reshape(-1, 3)
+
+
 # corrections
 def calc_mu_air(wavelength):
     """approximate attenuation coefficient of air"""

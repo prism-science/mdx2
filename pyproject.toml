@@ -31,6 +31,7 @@ dependencies = [
     "numba",
     "threadpoolctl",
     "psutil",
+    "msgpack",
 ]
 # dxtbx needs to be installed with conda
 
@@ -46,6 +47,7 @@ Issues = "https://github.com/ando-lab/mdx2/issues"
 "mdx2.version" = "mdx2.command_line.version:run"
 "mdx2.import_data" = "mdx2.command_line.import_data:run"
 "mdx2.import_geometry" = "mdx2.command_line.import_geometry:run"
+"mdx2.import_bragg" = "mdx2.command_line.import_bragg:run"
 "mdx2.find_peaks" = "mdx2.command_line.find_peaks:run"
 "mdx2.mask_peaks" = "mdx2.command_line.mask_peaks:run"
 "mdx2.tree" = "mdx2.command_line.tree:run"
