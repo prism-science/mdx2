@@ -2,6 +2,7 @@
 Integrate counts in an image stack on a Miller index grid
 """
 
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -10,13 +11,16 @@ from joblib import Parallel, delayed
 from loguru import logger
 from simple_parsing import field
 
+from mdx2 import profiling
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.geometry import load_mask
+from mdx2.integration import MillerIndexRegion, bin_chunk, chunk_columns, log_timers
 from mdx2.io import (
     loadobj,
     saveobj,
 )
+from mdx2.parallel import available_cpus
 
 
 @dataclass
@@ -31,6 +35,12 @@ class Parameters:
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
     outfile: str = "integrated.nxs"  # name of the output NeXus file
     logfile: str = "mdx2.integrate.log"  # name of the log file
+    engine: str = "fast"
+    """"fast" (default): one task per column of chunks along phi (a detector module with the default chunking),
+    compiled per-chunk binning, partial observations grouped (max_spread) within the module, so observations never
+    combine pixels from different modules; "reference": mdx2 <= 1.0.5 (one task per chunk, grouping over the whole
+    detector; kept for one release)"""
+    profile: bool = False  # log time per step, summed over the workers (fast engine)
 
     def __post_init__(self):
         """Validate subdivide and max_spread parameters"""
@@ -39,6 +49,50 @@ class Parameters:
                 raise ValueError(f"subdivide[{i}] must be > 0, got {div}")
         if self.max_spread <= 0:
             raise ValueError(f"max_spread must be > 0, got {self.max_spread}")
+        if self.engine not in ("fast", "reference"):
+            raise ValueError(f"Unknown engine {self.engine!r} (use 'fast' or 'reference')")
+
+
+def group_partials(tabs, max_degrees):
+    """Group per-chunk partial sums into observations: partials of a voxel whose mean phi lies within the same
+    max_degrees interval, counted from the voxel's earliest partial, are summed; mean positions. DataFrame indexed by
+    (h, k, l, n)."""
+    df = HKLTable.concatenate(tabs).to_frame()
+    df["tmp"] = df["phi"] / df["pixels"]
+    delta_phi = df.tmp - df.groupby(["h", "k", "l"])["tmp"].transform("min")
+    df["n"] = np.floor(delta_phi / max_degrees)
+    df = df.drop(columns=["tmp"])
+    df = df.groupby(["h", "k", "l", "n"]).sum()
+    df["phi"] = df["phi"] / df["pixels"]
+    df["iy"] = df["iy"] / df["pixels"]
+    df["ix"] = df["ix"] / df["pixels"]
+    return df
+
+
+def to_output_table(df, ndiv):
+    """integrated.nxs table from group_partials' DataFrame: columns h, k, l, n, pixels, phi, iy, ix, counts, seconds
+    in their output dtypes."""
+    hkl_table = HKLTable.from_frame(df)
+    hkl_table.ndiv = ndiv  # lost in conversion to/from dataframe
+    for c in ("h", "k", "l", "phi", "ix", "iy", "seconds"):
+        setattr(hkl_table, c, getattr(hkl_table, c).astype(np.float32))
+    hkl_table.counts = hkl_table.counts.astype(np.int32)
+    hkl_table.pixels = hkl_table.pixels.astype(np.int32)
+    return hkl_table
+
+
+def integrate_column(image_series, slices, miller_index, mask, ndiv, max_degrees):
+    """Fast-engine task: bin every chunk of one column (one detector module), group within the column.
+    Returns (output table or None, number of partial rows, seconds per step)."""
+    timer = {}
+    tabs = [bin_chunk(image_series, sl, miller_index, mask, ndiv, timer=timer) for sl in slices]
+    tabs = [t for t in tabs if t is not None]
+    if not tabs:
+        return None, 0, timer
+    t0 = time.perf_counter()
+    out = to_output_table(group_partials(tabs, max_degrees), ndiv)
+    timer["group"] = time.perf_counter() - t0
+    return out, sum(len(t) for t in tabs), timer
 
 
 def run_integrate(params):
@@ -51,9 +105,13 @@ def run_integrate(params):
     max_degrees = params.max_spread
     maskfile = params.mask
 
+    P = profiling.PROFILER = profiling.Profiler(params.profile)
+    clock = time.perf_counter
+    t0 = clock()
     logger.info("Loading geometry and image data...")
     MI = loadobj(geom, "miller_index")
     IS = loadobj(data, "image_series")
+    P.add("load", clock() - t0)
 
     if maskfile is not None:
         logger.info("Loading mask...")
@@ -63,60 +121,75 @@ def run_integrate(params):
     else:
         mask = None
 
-    def intchunk(sl):
-        ims = IS[sl]
-        tab = ims.index(MI, mask=None if mask is None else mask.for_chunk(sl))
-        tab.ndiv = ndiv
-        return tab.bin(count_name="pixels")
+    if params.engine == "reference":
 
-    slices = list(IS.chunk_slice_iterator())
-    logger.info("Integrating {} image chunks (requested n_jobs: {})...", len(slices), nproc)
-    with Parallel(n_jobs=nproc, verbose=10) as parallel:
-        log_parallel_backend(parallel)
-        T = parallel(delayed(intchunk)(sl) for sl in slices)
-    logger.info("Integration completed")
+        def intchunk(sl):
+            ims = IS[sl]
+            tab = ims.index(MI, mask=None if mask is None else mask.for_chunk(sl))
+            tab.ndiv = ndiv
+            return tab.bin(count_name="pixels")
 
-    logger.info("Summing partial observations over {} chunks...", len(T))
+        slices = list(IS.chunk_slice_iterator())
+        logger.info("Integrating {} image chunks (requested n_jobs: {})...", len(slices), nproc)
+        t0 = clock()
+        with Parallel(n_jobs=nproc, verbose=10) as parallel:
+            log_parallel_backend(parallel)
+            T = parallel(delayed(intchunk)(sl) for sl in slices)
+        P.add("tasks", clock() - t0)
+        logger.info("Integration completed")
+        logger.info("Summing partial observations over {} chunks...", len(T))
+        if not T:
+            raise ValueError(
+                "No integration results produced. The image series may be empty, or no valid data was found to "
+                "integrate."
+            )
+        t0 = clock()
+        df = group_partials(T, max_degrees)
+        voxels_before = np.sum([len(t) for t in T])
+        P.add("group (parent)", clock() - t0)
+    else:
+        columns = chunk_columns(IS)
+        logger.info(
+            "Integrating {} chunk columns (detector modules) of {} chunks each (requested n_jobs: {})...",
+            len(columns), len(columns[0]), nproc,
+        )  # fmt: skip
+        if nproc > len(columns) or (nproc < 0 and available_cpus() > len(columns)):
+            logger.info("At most {} processes are used (one per chunk column)", len(columns))
+        t0 = time.perf_counter()
 
-    # Handle empty results
-    if not T:
-        raise ValueError(
-            "No integration results produced. The image series may be empty, or no valid data was found to integrate."
-        )
+        def intcolumn(slices, region):
+            return integrate_column(IS, slices, region, mask, ndiv, max_degrees)
 
-    df = HKLTable.concatenate(T).to_frame()  # .set_index(['h','k','l'])
+        with Parallel(n_jobs=nproc, verbose=10) as parallel:
+            log_parallel_backend(parallel)
+            # each task carries only its part of the Miller-index grid
+            results = parallel(delayed(intcolumn)(c, MillerIndexRegion.for_column(MI, c)) for c in columns)
+        wall = time.perf_counter() - t0
+        logger.info("Integration completed")
+        frames = [r[0] for r in results if r[0] is not None]
+        if not frames:
+            raise ValueError(
+                "No integration results produced. The image series may be empty, or no valid data was found to "
+                "integrate."
+            )
+        P.add("tasks", wall)
+        log_timers([r[2] for r in results], wall, params.profile)
+        t0 = clock()
+        hkl_table = HKLTable.concatenate(frames)  # tables already in output form
+        voxels_before = sum(r[1] for r in results)
+        P.add("concatenate", clock() - t0)
 
-    df["tmp"] = df["phi"] / df["pixels"]
-    delta_phi = df.tmp - df.groupby(["h", "k", "l"])["tmp"].transform("min")
-    df["n"] = np.floor(delta_phi / max_degrees)
-    df = df.drop(columns=["tmp"])
+    if params.engine == "reference":
+        t0 = clock()
+        hkl_table = to_output_table(df, ndiv)
+        P.add("to table", clock() - t0)
+    logger.info("Binned from {} to {} voxels", voxels_before, len(hkl_table))
 
-    df = df.groupby(["h", "k", "l", "n"]).sum()
-
-    # compute mean positions in the scan
-    df["phi"] = df["phi"] / df["pixels"]
-    df["iy"] = df["iy"] / df["pixels"]
-    df["ix"] = df["ix"] / df["pixels"]
-
-    voxels_before = np.sum([len(t) for t in T])
-    voxels_after = len(df)
-    logger.info("Binned from {} to {} voxels", voxels_before, voxels_after)
-
-    hkl_table = HKLTable.from_frame(df)
-    hkl_table.ndiv = ndiv  # lost in conversion to/from dataframe
-
-    hkl_table.h = hkl_table.h.astype(np.float32)
-    hkl_table.k = hkl_table.k.astype(np.float32)
-    hkl_table.l = hkl_table.l.astype(np.float32)
-    hkl_table.phi = hkl_table.phi.astype(np.float32)
-    hkl_table.ix = hkl_table.ix.astype(np.float32)
-    hkl_table.iy = hkl_table.iy.astype(np.float32)
-    hkl_table.seconds = hkl_table.seconds.astype(np.float32)
-    hkl_table.counts = hkl_table.counts.astype(np.int32)
-    hkl_table.pixels = hkl_table.pixels.astype(np.int32)
-
+    t0 = clock()
     logger.info("Saving integrated data to {}...", outfile)
     saveobj(hkl_table, outfile, name="hkl_table", append=False)
+    P.add("save", clock() - t0)
+    P.summary()
     logger.info("Integration completed successfully")
 
 

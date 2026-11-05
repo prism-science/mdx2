@@ -2,6 +2,7 @@
 Reintegrate on a different grid, applying corrections, scaling, and merging symmetry-equivalent observations.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
@@ -10,14 +11,17 @@ from joblib import Parallel, delayed
 from loguru import logger
 from simple_parsing import field
 
+from mdx2 import profiling
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLGrid, HKLTable
 from mdx2.geometry import load_mask
+from mdx2.integration import MillerIndexRegion, bin_chunk, chunk_columns, log_timers
 from mdx2.io import (
     loadobj,
     nxload,  # mask is too big to read all at once?
     saveobj,
 )
+from mdx2.parallel import available_cpus
 
 # TODO: implement splitting
 # TODO: unify with mdx2.integrate, mdx2.correct
@@ -39,12 +43,19 @@ class Parameters:
     scale: Optional[str] = None  # NeXus file with scaling model
     background: Optional[str] = None  # NeXus file with background binned_image_series
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
+    engine: str = "fast"
+    """"fast" (default): one task per column of chunks along phi (a detector module with the default chunking),
+    compiled per-chunk binning, sums accumulated in the task; "reference": mdx2 <= 1.0.5 (one task per chunk; kept
+    for one release)"""
+    profile: bool = False  # log time per step, summed over the workers (fast engine)
     output: Literal["counts", "intensity"] = "counts"  # counts or intensity
     outfile: str = "reintegrated.nxs"  # name of the output data
     logfile: str = "mdx2.reintegrate.log"  # name of the log file
 
     def __post_init__(self):
         """Validate subdivide parameter"""
+        if self.engine not in ("fast", "reference"):
+            raise ValueError(f"Unknown engine {self.engine!r} (use 'fast' or 'reference')")
         for i, div in enumerate(self.subdivide):
             if div <= 0:
                 raise ValueError(f"subdivide[{i}] must be > 0, got {div}")
@@ -114,28 +125,106 @@ def calc_corrections(
     - Direct background from binned_image_series
     - Offset model contribution (if provided)
     """
+    P = profiling.PROFILER
     UB = crystal.ub_matrix
-    s = UB @ np.stack((tab.h, tab.k, tab.l))
-    tab.s = np.sqrt(np.sum(s * s, axis=0))
-    correction_factors = corrections.interpolate(tab.iy, tab.ix)
+    with P.step("s"):
+        s = UB @ np.stack((tab.h, tab.k, tab.l))
+        tab.s = np.sqrt(np.sum(s * s, axis=0))
+    with P.step("corrections_interp"):
+        correction_factors = corrections.interpolate(tab.iy, tab.ix)
     solid_angle = correction_factors["solid_angle"]
     solid_angle *= correction_factors["attenuation"]
     solid_angle *= correction_factors["polarization"]
     solid_angle *= correction_factors["efficiency"]
     tab.multiplicity = tab.pixels * correction_factors["d3s"] * np.prod(tab.ndiv) / np.linalg.det(UB)
-    b = scaling_model.interp(tab.phi) if scaling_model else 1.0
-    a = absorption_model.interp(tab.ix, tab.iy, tab.phi) if absorption_model else 1.0
-    d = detector_model.interp(tab.ix, tab.iy) if detector_model else 1.0
-    c = offset_model.interp(tab.s, tab.phi) if offset_model else 0.0
-    bg_rate = background.interpolate(tab.phi, tab.iy, tab.ix) if background else 0.0
+    with P.step("models"):
+        b = scaling_model.interp(tab.phi) if scaling_model else 1.0
+        a = absorption_model.interp(tab.ix, tab.iy, tab.phi) if absorption_model else 1.0
+        d = detector_model.interp(tab.ix, tab.iy) if detector_model else 1.0
+        c = offset_model.interp(tab.s, tab.phi) if offset_model else 0.0
+    with P.step("background"):
+        bg_rate = background.interpolate(tab.phi, tab.iy, tab.ix) if background else 0.0
     tab.scale = tab.seconds * solid_angle * a * b * d
     tab.background_counts = tab.seconds * (bg_rate + c * a * d * solid_angle)
-    tab = tab.to_asu(symmetry)
+    with P.step("to_asu"):
+        tab = tab.to_asu(symmetry)
     del tab.phi, tab.iy, tab.ix, tab.seconds, tab.s, tab.op, tab.pixels
     return tab
 
 
+def reintegrate_chunk(
+    image_series, sl, miller_index, mask, ndiv, crystal, corrections, symmetry,
+    scaling_model=None, absorption_model=None, detector_model=None, offset_model=None, background=None,
+):  # fmt: skip
+    """Work done for one image chunk (slices sl): read, index (with the mask), bin, corrections.
+
+    Returns an HKLTable on the subdivided grid (asymmetric unit) with counts, pixels-weighted multiplicity, scale
+    and background_counts, or None if no pixel was integrated. Steps are recorded by mdx2.profiling when enabled.
+    """
+    P = profiling.PROFILER
+    with P.step("read"):
+        ims = image_series[sl]
+    with P.step("index"):
+        tab = ims.index(miller_index, mask=None if mask is None else mask.for_chunk(sl))
+    if len(tab) == 0:
+        return None  # signal that no pixels were integrated
+    with P.step("bin", rows=len(tab)):
+        tab.ndiv = ndiv
+        tab = tab.bin(count_name="pixels")
+        tab.phi /= tab.pixels
+        tab.iy /= tab.pixels
+        tab.ix /= tab.pixels
+    with P.step("corrections", rows=len(tab)):
+        tab = calc_corrections(
+            tab, crystal, corrections, symmetry, scaling_model, absorption_model, detector_model, offset_model,
+            background,
+        )  # fmt: skip
+        tab.h = tab.h.astype(np.float32)
+        tab.k = tab.k.astype(np.float32)
+        tab.l = tab.l.astype(np.float32)
+    return tab
+
+
+def reintegrate_column(
+    image_series, slices, miller_index, mask, ndiv, crystal, corrections, symmetry,
+    scaling_model=None, absorption_model=None, detector_model=None, offset_model=None, background=None,
+):  # fmt: skip
+    """Fast-engine task: one column of chunks (one detector module). Compiled per-chunk binning (bin_chunk), the
+    corrections per chunk, sums over the column by voxel (asymmetric unit). Returns (HKLTable or None, seconds per
+    step)."""
+    timer = {}
+    tabs = []
+    for sl in slices:
+        tab = bin_chunk(image_series, sl, miller_index, mask, ndiv, timer=timer)
+        if tab is None:
+            continue
+        t0 = time.perf_counter()
+        tab.phi /= tab.pixels
+        tab.iy /= tab.pixels
+        tab.ix /= tab.pixels
+        tab = calc_corrections(
+            tab, crystal, corrections, symmetry, scaling_model, absorption_model, detector_model, offset_model,
+            background,
+        )  # fmt: skip
+        timer["corrections"] = timer.get("corrections", 0.0) + time.perf_counter() - t0
+        tabs.append(tab)
+    if not tabs:
+        return None, timer
+    t0 = time.perf_counter()
+    tab = HKLTable.concatenate(tabs).bin(
+        column_names=["counts", "background_counts", "scale", "multiplicity"], count_name=None
+    )
+    tab.h = tab.h.astype(np.float32)
+    tab.k = tab.k.astype(np.float32)
+    tab.l = tab.l.astype(np.float32)
+    timer["accumulate"] = time.perf_counter() - t0
+    return tab, timer
+
+
 def run_reintegrate(params):
+    P = profiling.PROFILER = profiling.Profiler(params.profile)
+    clock = time.perf_counter
+    t_load = clock()
     logger.info("Loading geometry and image data...")
     miller_index = loadobj(params.geom, "miller_index")
     image_series = loadobj(params.data, "image_series")
@@ -167,60 +256,100 @@ def run_reintegrate(params):
         mask.check_axes(image_series.phi, image_series.iy, image_series.ix)
 
     def intchunk(sl):
-        ims = image_series[sl]
-        tab = ims.index(miller_index, mask=None if mask is None else mask.for_chunk(sl))
-        if len(tab) == 0:
-            return None  # signal that no pixels were integrated
-        tab.ndiv = params.subdivide
-        tab = tab.bin(count_name="pixels")
-        tab.phi /= tab.pixels
-        tab.iy /= tab.pixels
-        tab.ix /= tab.pixels
-        tab = calc_corrections(
-            tab,
-            crystal,
-            corrections,
-            symmetry,
-            scaling_model,
-            absorption_model,
-            detector_model,
-            offset_model,
-            background,
-        )
-        tab.h = tab.h.astype(np.float32)
-        tab.k = tab.k.astype(np.float32)
-        tab.l = tab.l.astype(np.float32)
-        return tab
+        return reintegrate_chunk(
+            image_series, sl, miller_index, mask, params.subdivide, crystal, corrections, symmetry,
+            scaling_model, absorption_model, detector_model, offset_model, background,
+        )  # fmt: skip
 
     # TODO: check for memory limitations, consider using memory mapping for large datasets
 
-    logger.info("Calculating Miller index range for output grid...")
-    hkl = HKLTable(miller_index.h.ravel(), miller_index.k.ravel(), miller_index.l.ravel(), ndiv=params.subdivide)
-    hkl = hkl.to_asu(symmetry)
-    array_range = (min(hkl.H.min(), 0), hkl.H.max(), min(hkl.K.min(), 0), hkl.K.max(), min(hkl.L.min(), 0), hkl.L.max())
-    array_size = tuple(hi - lo + 1 for lo, hi in zip(array_range[::2], array_range[1::2]))
-    array_ori = tuple(lo / s for lo, s in zip(array_range[::2], params.subdivide))
-    logger.info("Output grid size: {}", array_size)
-    logger.info("Allocating empty output arrays...")
-    data_arrays = {
-        "counts": np.zeros(array_size, dtype=np.uint32),
-        "background_counts": np.zeros(array_size, dtype=np.float32),
-        "scale": np.zeros(array_size, dtype=np.float32),
-        "multiplicity": np.zeros(array_size, dtype=np.float32),
-    }
-    grid = HKLGrid(data_arrays, ndiv=params.subdivide, ori=array_ori)
+    P.add("load", clock() - t_load)
 
-    slices = list(image_series.chunk_slice_iterator())
-    logger.info("Reintegrating {} image chunks (requested n_jobs: {})...", len(slices), params.nproc)
-    with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
-        log_parallel_backend(parallel)
-        tab_chunk = parallel(delayed(intchunk)(sl) for sl in slices)
-        for tab in tab_chunk:
-            if tab is None:
-                continue
+    def make_grid(array_range):
+        """Empty output arrays covering array_range = (Hmin, Hmax, Kmin, Kmax, Lmin, Lmax) (subdivided indices)."""
+        array_size = tuple(hi - lo + 1 for lo, hi in zip(array_range[::2], array_range[1::2]))
+        array_ori = tuple(lo / s for lo, s in zip(array_range[::2], params.subdivide))
+        logger.info("Output grid size: {}", array_size)
+        data_arrays = {
+            "counts": np.zeros(array_size, dtype=np.uint32),
+            "background_counts": np.zeros(array_size, dtype=np.float32),
+            "scale": np.zeros(array_size, dtype=np.float32),
+            "multiplicity": np.zeros(array_size, dtype=np.float32),
+        }
+        return HKLGrid(data_arrays, ndiv=params.subdivide, ori=array_ori)
+
+    t_grid = clock()
+    if params.engine == "reference":
+        logger.info("Calculating Miller index range for output grid...")
+        hkl = HKLTable(miller_index.h.ravel(), miller_index.k.ravel(), miller_index.l.ravel(), ndiv=params.subdivide)
+        hkl = hkl.to_asu(symmetry)
+        grid = make_grid(
+            (min(hkl.H.min(), 0), hkl.H.max(), min(hkl.K.min(), 0), hkl.K.max(), min(hkl.L.min(), 0), hkl.L.max())
+        )
+        del hkl
+    if params.engine == "reference":
+        P.add("grid setup", clock() - t_grid)
+    t_tasks = clock()
+    if params.engine == "reference":
+        slices = list(image_series.chunk_slice_iterator())
+        logger.info("Reintegrating {} image chunks (requested n_jobs: {})...", len(slices), params.nproc)
+        # results in submission order: the float32 sums do not depend on which task finishes first
+        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator") as parallel:
+            log_parallel_backend(parallel)
+            tab_chunk = parallel(delayed(intchunk)(sl) for sl in slices)
+            for tab in tab_chunk:
+                if tab is None:
+                    continue
+                grid.accumulate_from_table(tab, resize=False)
+        P.add("tasks + accumulate", clock() - t_tasks)
+    else:
+        columns = chunk_columns(image_series)
+        logger.info(
+            "Reintegrating {} chunk columns (detector modules) of {} chunks each (requested n_jobs: {})...",
+            len(columns), len(columns[0]), params.nproc,
+        )  # fmt: skip
+        if params.nproc > len(columns) or (params.nproc < 0 and available_cpus() > len(columns)):
+            logger.info("At most {} processes are used (one per chunk column)", len(columns))
+
+        def intcolumn(slices, region):
+            return reintegrate_column(
+                image_series, slices, region, mask, params.subdivide, crystal, corrections, symmetry,
+                scaling_model, absorption_model, detector_model, offset_model, background,
+            )  # fmt: skip
+
+        t0 = time.perf_counter()
+        timers = []
+        # results in submission order (all are kept until the grid is sized anyway): the float32 sums are then
+        # reproducible from run to run
+        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator") as parallel:
+            log_parallel_backend(parallel)
+            # each task carries only its part of the Miller-index grid
+            tasks = (delayed(intcolumn)(c, MillerIndexRegion.for_column(miller_index, c)) for c in columns)
+            tabs = []
+            for tab, timer in parallel(tasks):
+                timers.append(timer)
+                if tab is not None:
+                    tabs.append(tab)
+        P.add("tasks", time.perf_counter() - t0)
+        log_timers(timers, time.perf_counter() - t0, params.profile)
+        # output grid from the range of the results (the reference engine maps the whole Miller-index grid to the
+        # asymmetric unit for this); origin included, as there
+        t1 = clock()
+        idx = [
+            [np.round(np.asarray(getattr(t, c)) * n).astype(np.int64) for t in tabs]
+            for c, n in zip("hkl", params.subdivide)
+        ]
+        rng = []
+        for parts in idx:
+            rng += [min(0, *(int(p.min()) for p in parts)), max(int(p.max()) for p in parts)]
+        grid = make_grid(tuple(rng))
+        for tab in tabs:
             grid.accumulate_from_table(tab, resize=False)
+        del tabs, idx
+        P.add("grid setup + accumulate", clock() - t1)
     logger.info("Reintegration completed")
 
+    t_tab = clock()
     logger.info("Converting grid to sparse table...")
     hkl_table = grid.to_table(sparse=True)
     hkl_table.h = hkl_table.h.astype(np.float32)
@@ -239,8 +368,12 @@ def run_reintegrate(params):
         hkl_table.intensity = hkl_table.intensity.astype(np.float32)
         hkl_table.intensity_error = hkl_table.intensity_error.astype(np.float32)
 
+    P.add("to table + intensity", clock() - t_tab)
+    t_save = clock()
     logger.info("Saving reintegrated data to {}...", params.outfile)
     saveobj(hkl_table, params.outfile, name="hkl_table", append=False)
+    P.add("save", clock() - t_save)
+    P.summary()
     logger.info("Reintegration completed successfully")
 
 

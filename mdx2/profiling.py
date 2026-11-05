@@ -68,6 +68,17 @@ class Profiler:
                 self._fh.write(json.dumps(rec) + "\n")
                 self._fh.flush()
 
+    def add(self, name, seconds, **info):
+        """Record a step timed by the caller (no nesting)."""
+        if not self.enabled:
+            return
+        rec = dict(step=name, stage=self.stage, depth=len(self._stack), seconds=round(seconds, 4),
+                   rss_gb=_gb(_rss()), peak_rss_gb=_gb(_peak_rss()), **info)  # fmt: skip
+        self.records.append(rec)
+        if self._fh is not None:
+            self._fh.write(json.dumps(rec) + "\n")
+            self._fh.flush()
+
     def note(self, **kv):
         """Attach values to the innermost open step (repeated keys, e.g. one per batch, become lists)."""
         if not self.enabled or not self._stack:

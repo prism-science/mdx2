@@ -224,10 +224,8 @@ class HKLTable:
                     f"tabs[0].ndiv={ndiv}, tabs[{j}].ndiv={tabs[j].ndiv}"
                 )
 
-        # Find data keys common to all tables
-        data_keys = set(tabs[0]._data_keys)
-        for j in range(1, len(tabs)):
-            data_keys &= set(tabs[j]._data_keys)
+        # Data keys common to all tables, in the order of the first one
+        data_keys = [k for k in tabs[0]._data_keys if all(k in t._data_keys for t in tabs[1:])]
 
         def concat(key):
             return np.concatenate([tab.__dict__[key] for tab in tabs])
@@ -513,11 +511,18 @@ class ImageSeries:
         return (self.phi.size, self.iy.size, self.ix.size)
 
     def __getitem__(self, sl):
+        sub = self.data[sl]
+        data = self._as_np(sub)  # force a read and set to numpy array
+        if isinstance(sub, NXfield):
+            # the temporary NXfield and its attribute dict reference each other: drop its reference to the data, so
+            # the array is freed with this ImageSeries rather than at the next cyclic garbage collection (otherwise
+            # each chunk read stays in memory for a while: GBs per worker for large detectors)
+            sub._value = None
         return ImageSeries(
             self.phi[sl[0]],
             self.iy[sl[1]],
             self.ix[sl[2]],
-            self._as_np(self.data[sl]),  # force a read and set to numpy array
+            data,
             self.exposure_times[sl[0]],
         )
 
@@ -769,26 +774,31 @@ class ImageSeries:
     def index(self, miller_index, mask=None):
         """Table of unmasked pixels with their Miller indices. mask: boolean array (True = excluded) or a function of
         the regridded Miller indices returning one (dynamic masks, see mdx2.geometry.PeakMask.for_chunk)."""
-        mi = miller_index.regrid(self.phi, self.iy, self.ix)
+        P = profiling.PROFILER
+        with P.step("regrid"):
+            mi = miller_index.regrid(self.phi, self.iy, self.ix)
         if callable(mask):
-            mask = mask(mi)
-        phi, iy, ix = np.meshgrid(self.phi, self.iy, self.ix, indexing="ij")
-        # HACK to get this the right shape...
-        exposure_times = np.tile(self.exposure_times, (self.iy.size, self.ix.size, 1))
-        exposure_times = np.moveaxis(exposure_times, 2, 0)
-        msk = self.data != self._maskval
-        if mask is not None:
-            msk = msk & ~mask  # mask is true when pixels are excluded
-        return HKLTable(
-            mi.h[msk],
-            mi.k[msk],
-            mi.l[msk],
-            phi=phi[msk],
-            iy=iy[msk],
-            ix=ix[msk],
-            counts=self.data[msk],
-            seconds=exposure_times[msk],
-        )
+            with P.step("mask"):
+                mask = mask(mi)
+        with P.step("select"):
+            phi, iy, ix = np.meshgrid(self.phi, self.iy, self.ix, indexing="ij")
+            # HACK to get this the right shape...
+            exposure_times = np.tile(self.exposure_times, (self.iy.size, self.ix.size, 1))
+            exposure_times = np.moveaxis(exposure_times, 2, 0)
+            msk = self.data != self._maskval
+            if mask is not None:
+                msk = msk & ~mask  # mask is true when pixels are excluded
+            tab = HKLTable(
+                mi.h[msk],
+                mi.k[msk],
+                mi.l[msk],
+                phi=phi[msk],
+                iy=iy[msk],
+                ix=ix[msk],
+                counts=self.data[msk],
+                seconds=exposure_times[msk],
+            )
+        return tab
 
 
 # SOME UTILITY FUNCTIONS USED ABOVE
