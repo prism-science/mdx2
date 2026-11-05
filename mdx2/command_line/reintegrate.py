@@ -12,6 +12,7 @@ from simple_parsing import field
 
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLGrid, HKLTable
+from mdx2.geometry import load_mask
 from mdx2.io import (
     loadobj,
     nxload,  # mask is too big to read all at once?
@@ -161,14 +162,13 @@ def run_reintegrate(params):
         detector_model = None
     # NXfield objects can be pickled safely (they serialize metadata and reopen the file in each worker)
     # so this works correctly with nproc > 1 despite being passed to joblib.Parallel
-    mask = nxload(params.mask).entry.mask.signal if params.mask else None
+    mask = load_mask(params.mask) if params.mask else None  # static (read per chunk) or dynamic (rebuilt per chunk)
+    if mask is not None:
+        mask.check_axes(image_series.phi, image_series.iy, image_series.ix)
 
     def intchunk(sl):
         ims = image_series[sl]
-        if mask is not None:
-            tab = ims.index(miller_index, mask=mask[sl].nxdata)  # added nxdata to deal with NXfield wrapper
-        else:
-            tab = ims.index(miller_index)
+        tab = ims.index(miller_index, mask=None if mask is None else mask.for_chunk(sl))
         if len(tab) == 0:
             return None  # signal that no pixels were integrated
         tab.ndiv = params.subdivide
