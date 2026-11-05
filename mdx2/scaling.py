@@ -585,10 +585,15 @@ class _Grid:
     """Uniform control-point grid of an mdx2 model (axes as in the model, Fortran order)."""
 
     def __init__(self, axes):
+        # axes may be float32 (numpy >= 2 keeps float32 through np.linspace when the limits come from float32 data):
+        # judge uniformity at the precision the axis was stored in
+        eps = [np.finfo(np.asarray(a).dtype).eps if np.issubdtype(np.asarray(a).dtype, np.floating) else 0.0 for a in axes]
         self.axes = [np.asarray(a, dtype=np.float64) for a in axes]
-        for a in self.axes:
+        for a, e in zip(self.axes, eps):
             assert a.size >= 2, "mdx2 interpolation needs at least two control points per axis"
-            assert np.allclose(np.diff(a), (a[-1] - a[0]) / (a.size - 1), rtol=1e-9, atol=1e-12), "non-uniform axis"
+            step = (a[-1] - a[0]) / (a.size - 1)
+            tol = 1e-9 * abs(step) + 16 * e * max(abs(a[0]), abs(a[-1]))
+            assert np.all(np.abs(np.diff(a) - step) <= tol), "non-uniform axis"
         self.lo = np.array([a[0] for a in self.axes])
         self.hi = np.array([a[-1] for a in self.axes])
         self.N = np.array([a.size for a in self.axes], dtype=np.int64)
