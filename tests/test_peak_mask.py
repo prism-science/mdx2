@@ -109,7 +109,8 @@ def test_mask_shape_mismatch(sweep):
 
 
 def test_file_is_self_describing(sweep):
-    """The mask file holds the numexpr expressions; evaluating them by hand reproduces the mask."""
+    """The mask file holds the numexpr expressions; evaluating them by hand (rule in the PeakMask docstring)
+    reproduces the mask."""
     import numexpr as ne  # noqa: PLC0415
 
     from mdx2.io import nxload  # noqa: PLC0415
@@ -117,7 +118,7 @@ def test_file_is_self_describing(sweep):
     tmp_path, geom, dat, pk = sweep
     _, fd = make_masks(tmp_path, geom, dat, pk)
     g = nxload(fd)["entry/mask"]
-    assert "excluded = " in g.attrs["description"] and g.sigma_cutoff.nxvalue == 2.0
+    assert g.sigma_cutoff.nxvalue == 2.0
     D = load_mask(fd)
     mi, ims = loadobj(geom, "miller_index"), loadobj(dat, "image_series")
     sl = next(iter(ims.chunk_slice_iterator()))

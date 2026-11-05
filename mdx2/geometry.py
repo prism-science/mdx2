@@ -467,10 +467,6 @@ class PeakMask:
     """
 
     FORMAT_VERSION = 1
-    DESCRIPTION = (
-        "excluded = (bragg XOR [reflection_conditions(round(h), round(k), round(l)) AND peak_expression(h, k, l)]) "
-        "OR (frame, iy, ix) in pixels; numexpr syntax; h, k, l = fractional Miller indices at each pixel"
-    )
 
     def __init__(
         self, peak_expression, reflection_conditions, shape, pixels=None, bragg=False,
@@ -536,7 +532,6 @@ class PeakMask:
             if getattr(self, name) is not None:
                 g[name] = getattr(self, name)
         g.attrs["format_version"] = self.FORMAT_VERSION
-        g.attrs["description"] = self.DESCRIPTION
         return g
 
     @staticmethod
