@@ -57,3 +57,24 @@ def unpack_kernel(codes, out):
             for x in range(nx):
                 c = codes[z, y, x]
                 out[z, y, x] = -1 if c == MASKED16 else np.int32(c)
+
+
+def pack_frame(frame, buf):
+    """int32 frame (masked = -1) -> uint16 codes in buf. Returns the overflow pixels (y, x, int32 values) or None."""
+    if pack_frame_kernel(frame, buf):
+        y, x = np.nonzero(buf == OVERFLOW16)
+        return y, x, frame[y, x].astype(np.int32)
+    return None
+
+
+_ALL_VALID = np.ones((1, 1), dtype=np.bool_)
+
+
+def pack_raw(raw, lo, hi, static_mask, buf):
+    """Detector frame -> uint16 codes in buf, masked outside [lo, hi] and where static_mask is False (if not None).
+    Returns the overflow pixels (y, x, int32 values) or None."""
+    valid = static_mask if static_mask is not None else _ALL_VALID
+    if pack_raw_kernel(raw, lo, hi, valid, static_mask is not None, buf):
+        y, x = np.nonzero(buf == OVERFLOW16)
+        return y, x, raw[y, x].astype(np.int32)
+    return None
