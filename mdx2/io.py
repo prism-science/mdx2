@@ -1,7 +1,7 @@
 import importlib
 import warnings
-import h5py
 
+import h5py
 from nexusformat.nexus import NXentry, NXgroup, NXroot, NXvirtualfield
 from nexusformat.nexus import nxload as nexus_nxload
 

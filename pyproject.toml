@@ -37,7 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=6.0"]
-dev = ["ruff>=0.1.0", "pytest>=6.0"]
+dev = ["ruff==0.14.8", "pytest>=6.0"]  # ruff pinned: same version as the lint job in CI
 
 [project.urls]
 Homepage = "https://github.com/ando-lab/mdx2"
@@ -73,6 +73,7 @@ mdx2 = ["**/_*.ipynb"]
 
 [tool.ruff]
 line-length = 120
+extend-exclude = ["*.ipynb"]  # notebooks (report templates, examples) are not linted or formatted
 indent-width = 4
 
 [tool.ruff.format]

@@ -2,7 +2,8 @@
 Generate jupyter notebook reports.
 """
 
-from dataclasses import asdict, dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from typing import ClassVar, Optional
 
 # from simple_parsing.helpers.fields import subparsers
