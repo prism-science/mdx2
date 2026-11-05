@@ -9,7 +9,7 @@ from mdx2.command_line.integrate import run_integrate
 from mdx2.command_line.reintegrate import Parameters as ReintParams
 from mdx2.command_line.reintegrate import run_reintegrate
 from mdx2.geometry import load_mask
-from mdx2.integration import bin_chunk, chunk_columns
+from mdx2.integration import MillerIndexRegion, bin_chunk, chunk_columns
 from mdx2.io import loadobj
 
 from .test_peak_mask import make_masks, write_sweep
@@ -98,3 +98,20 @@ def test_integrate_per_module(sweep):
     ga = a.groupby(["h", "k", "l"]).counts.sum()
     gb = b.groupby(["h", "k", "l"]).counts.sum()
     pd.testing.assert_series_equal(ga, gb)
+
+
+def test_bin_chunk_with_region(sweep):
+    """A task's part of the Miller-index grid gives the same result as the whole grid."""
+    tmp_path, geom, dat, pk = sweep
+    mi, ims = loadobj(geom, "miller_index"), loadobj(dat, "image_series")
+    mask = masks(sweep)["dynamic"]
+    for col in chunk_columns(ims):
+        region = MillerIndexRegion.for_column(mi, col)
+        assert region.h.size < mi.h.size or len(chunk_columns(ims)) == 1
+        for sl in col:
+            a, b = bin_chunk(ims, sl, mi, mask, (2, 2, 2)), bin_chunk(ims, sl, region, mask, (2, 2, 2))
+            if a is None:
+                assert b is None
+                continue
+            for c in ["h", "k", "l"] + list(a._data_keys):
+                np.testing.assert_array_equal(getattr(a, c), getattr(b, c), err_msg=c)

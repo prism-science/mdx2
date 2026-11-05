@@ -15,7 +15,7 @@ from mdx2 import profiling
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLGrid, HKLTable
 from mdx2.geometry import load_mask
-from mdx2.integration import bin_chunk, chunk_columns, log_timers
+from mdx2.integration import MillerIndexRegion, bin_chunk, chunk_columns, log_timers
 from mdx2.io import (
     loadobj,
     nxload,  # mask is too big to read all at once?
@@ -295,9 +295,9 @@ def run_reintegrate(params):
         if params.nproc > len(columns) or (params.nproc < 0 and available_cpus() > len(columns)):
             logger.info("At most {} processes are used (one per chunk column)", len(columns))
 
-        def intcolumn(slices):
+        def intcolumn(slices, region):
             return reintegrate_column(
-                image_series, slices, miller_index, mask, params.subdivide, crystal, corrections, symmetry,
+                image_series, slices, region, mask, params.subdivide, crystal, corrections, symmetry,
                 scaling_model, absorption_model, detector_model, offset_model, background,
             )  # fmt: skip
 
@@ -305,7 +305,9 @@ def run_reintegrate(params):
         timers = []
         with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
             log_parallel_backend(parallel)
-            for tab, timer in parallel(delayed(intcolumn)(c) for c in columns):
+            # each task carries only its part of the Miller-index grid
+            tasks = (delayed(intcolumn)(c, MillerIndexRegion.for_column(miller_index, c)) for c in columns)
+            for tab, timer in parallel(tasks):
                 timers.append(timer)
                 if tab is not None:
                     grid.accumulate_from_table(tab, resize=False)

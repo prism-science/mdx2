@@ -15,7 +15,7 @@ from simple_parsing import field
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
 from mdx2.geometry import load_mask
-from mdx2.integration import bin_chunk, chunk_columns, log_timers
+from mdx2.integration import MillerIndexRegion, bin_chunk, chunk_columns, log_timers
 from mdx2.io import (
     loadobj,
     saveobj,
@@ -136,12 +136,13 @@ def run_integrate(params):
             logger.info("At most {} processes are used (one per chunk column)", len(columns))
         t0 = time.perf_counter()
 
-        def intcolumn(slices):
-            return integrate_column(IS, slices, MI, mask, ndiv, max_degrees)
+        def intcolumn(slices, region):
+            return integrate_column(IS, slices, region, mask, ndiv, max_degrees)
 
         with Parallel(n_jobs=nproc, verbose=10) as parallel:
             log_parallel_backend(parallel)
-            results = parallel(delayed(intcolumn)(c) for c in columns)
+            # each task carries only its part of the Miller-index grid
+            results = parallel(delayed(intcolumn)(c, MillerIndexRegion.for_column(MI, c)) for c in columns)
         wall = time.perf_counter() - t0
         logger.info("Integration completed")
         frames = [r[0] for r in results if r[0] is not None]

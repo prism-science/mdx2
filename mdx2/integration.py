@@ -29,6 +29,31 @@ def chunk_columns(image_series):
     return [sorted(v, key=lambda s: s[0].start) for _, v in sorted(cols.items())]
 
 
+class MillerIndexRegion:
+    """The part of a MillerIndex lookup grid that a set of chunks needs: full axes (phi, iy, ix) for the
+    interpolation weights, h, k, l only for the grid nodes covering an iy / ix range (offset = index of the first
+    node along each axis). Lets a task carry ~1/N of the grid for 1/N of the detector."""
+
+    def __init__(self, miller_index, iy_range, ix_range):
+        mi = miller_index
+        self.phi, self.iy, self.ix = mi.phi, mi.iy, mi.ix
+        lo, hi = [], []
+        for ax, (a, b) in ((mi.iy, iy_range), (mi.ix, ix_range)):
+            i0 = max(int(np.searchsorted(ax, a, side="right")) - 2, 0)
+            i1 = min(int(np.searchsorted(ax, b, side="left")) + 2, ax.size)
+            lo.append(i0)
+            hi.append(i1)
+        self.offset = (0, lo[0], lo[1])
+        sub = (slice(None), slice(lo[0], hi[0]), slice(lo[1], hi[1]))
+        self.h, self.k, self.l = (np.ascontiguousarray(a[sub]) for a in (mi.h, mi.k, mi.l))
+
+    @staticmethod
+    def for_column(miller_index, slices):
+        iy = [v for sl in slices for v in (sl[1].start, sl[1].stop - 1)]
+        ix = [v for sl in slices for v in (sl[2].start, sl[2].stop - 1)]
+        return MillerIndexRegion(miller_index, (min(iy), max(iy)), (min(ix), max(ix)))
+
+
 def _peak_parameters(mask):
     """Numbers for the kernel's ellipsoid test, verified to reproduce the mask's stored peak_expression."""
     cached = getattr(mask, "_kernel_parameters", None)
@@ -60,7 +85,10 @@ def bin_chunk(image_series, sl, miller_index, mask=None, ndiv=(1, 1, 1), timer=N
     bs = _base_fraction(ims.phi, axis=mi.phi), _base_fraction(ims.iy, axis=mi.iy), _base_fraction(ims.ix, axis=mi.ix)
     order = np.argsort([b.size for b, _ in bs]).astype(np.int64)  # as mdx2.utils._quick_trilinear_g2g
     # grid nodes the chunk touches; trilinear values are convex combinations of them, which bounds h, k, l
-    sub = tuple(slice(int(b.min()), int(b.max()) + 2) for b, _ in bs)
+    off = getattr(mi, "offset", (0, 0, 0))  # MillerIndexRegion: h, k, l cover part of the grid
+    sub = tuple(slice(int(b.min()) - o, int(b.max()) + 2 - o) for (b, _), o in zip(bs, off))
+    if any(s.start < 0 or s.stop > n for s, n in zip(sub, mi.h.shape)):
+        raise ValueError("chunk outside the Miller-index region")
     hs, ks, ls = mi.h[sub], mi.k[sub], mi.l[sub]
     Hg, Kg, Lg = (np.ascontiguousarray(np.transpose(a, order)) for a in (hs, ks, ls))
     bsort = [np.ascontiguousarray(bs[o][0] - bs[o][0].min(), dtype=np.int64) for o in order]
