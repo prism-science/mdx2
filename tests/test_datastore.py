@@ -36,6 +36,8 @@ def test_datastore_round_trip(tmp_path, compression):
     with h5py.File(loaded.virtual_source_files[0], "r") as f:
         ds = f[loaded.virtual_dataset_path]
         assert FILTER[compression] in ds._filters, list(ds._filters)
+        if compression.startswith("blosc"):  # Blosc only: no HDF5 byte-shuffle before it (nexusformat's default)
+            assert list(ds._filters) == [FILTER[compression]], list(ds._filters)
         assert ds.chunks == chunks
 
 

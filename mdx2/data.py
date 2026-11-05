@@ -486,11 +486,18 @@ class HKLGrid:
 
 
 # Datastore compression (mdx2.import_data). The datastore is disposable (regenerated from the images), so read and
-# write speed come first: Blosc LZ4 + bitshuffle reads ~2x faster than gzip-1 + shuffle on Intel and AMD, writes ~4x
-# faster, and is about as small (benchmark: mdx3_project reint_opt/CODECS.md).
+# write speed come first: Blosc LZ4 + bitshuffle reads ~2-3x faster than gzip-1 + shuffle on Intel and AMD (Eiger 16M
+# datastore, Xeon, one thread: 283 -> 92 ms per chunk), writes ~4x faster, and is slightly smaller (benchmarks:
+# mdx3_project reint_opt/CODECS.md and IMPORT.md).
+# shuffle=False: Blosc bitshuffles internally; nexusformat otherwise adds HDF5's byte-shuffle filter to large fields,
+# an extra pass on every read and write (mdx2 1.1 dev datastores before this fix have it; they read correctly).
 DATASTORE_COMPRESSION = {
-    "blosc-lz4": dict(compression=hdf5plugin.Blosc(cname="lz4", clevel=5, shuffle=hdf5plugin.Blosc.BITSHUFFLE)),
-    "blosc-zstd": dict(compression=hdf5plugin.Blosc(cname="zstd", clevel=1, shuffle=hdf5plugin.Blosc.BITSHUFFLE)),
+    "blosc-lz4": dict(
+        compression=hdf5plugin.Blosc(cname="lz4", clevel=5, shuffle=hdf5plugin.Blosc.BITSHUFFLE), shuffle=False
+    ),
+    "blosc-zstd": dict(
+        compression=hdf5plugin.Blosc(cname="zstd", clevel=1, shuffle=hdf5plugin.Blosc.BITSHUFFLE), shuffle=False
+    ),
     "gzip": dict(compression="gzip", compression_opts=1, shuffle=True),  # mdx2 <= 1.0.5
 }
 
