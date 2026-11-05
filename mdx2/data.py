@@ -767,7 +767,11 @@ class ImageSeries:
         return ImageSeries.from_nexus(nxs)
 
     def index(self, miller_index, mask=None):
+        """Table of unmasked pixels with their Miller indices. mask: boolean array (True = excluded) or a function of
+        the regridded Miller indices returning one (dynamic masks, see mdx2.geometry.PeakMask.for_chunk)."""
         mi = miller_index.regrid(self.phi, self.iy, self.ix)
+        if callable(mask):
+            mask = mask(mi)
         phi, iy, ix = np.meshgrid(self.phi, self.iy, self.ix, indexing="ij")
         # HACK to get this the right shape...
         exposure_times = np.tile(self.exposure_times, (self.iy.size, self.ix.size, 1))
