@@ -3,6 +3,9 @@ from copy import deepcopy
 
 import h5py
 import numpy as np
+
+os.environ.setdefault("BLOSC_NTHREADS", "1")  # Blosc filters single-threaded: mdx2 parallelizes over processes / chunks
+import hdf5plugin  # noqa: E402  (registers the Blosc, LZ4, Bitshuffle, ... HDF5 filters)
 import pandas as pd
 from nexusformat.nexus import NXdata, NXfield, NXgroup, NXreflections, NXvirtualfield
 
@@ -484,6 +487,16 @@ class HKLGrid:
         return f"HKLGrid with shape:{self.shape}, ori:{self.ori}, ndiv:{self.ndiv}, keys:{tuple(self._data.keys())}"
 
 
+# Datastore compression (mdx2.import_data). The datastore is disposable (regenerated from the images), so read and
+# write speed come first: Blosc LZ4 + bitshuffle reads ~2x faster than gzip-1 + shuffle on Intel and AMD, writes ~4x
+# faster, and is about as small (benchmark: mdx3_project reint_opt/CODECS.md).
+DATASTORE_COMPRESSION = {
+    "blosc-lz4": dict(compression=hdf5plugin.Blosc(cname="lz4", clevel=5, shuffle=hdf5plugin.Blosc.BITSHUFFLE)),
+    "blosc-zstd": dict(compression=hdf5plugin.Blosc(cname="zstd", clevel=1, shuffle=hdf5plugin.Blosc.BITSHUFFLE)),
+    "gzip": dict(compression="gzip", compression_opts=1, shuffle=True),  # mdx2 <= 1.0.5
+}
+
+
 class ImageSeries:
     """Image stack resulting from single sweep of data"""
 
@@ -649,8 +662,11 @@ class ImageSeries:
             yield new_image_series
 
     @staticmethod
-    def from_expt(exptfile):
-        data_opts = {"dtype": np.int32, "compression": "gzip", "compression_opts": 1, "shuffle": True}
+    def from_expt(exptfile, compression="blosc-lz4"):
+        """compression: a key of DATASTORE_COMPRESSION"""
+        if compression not in DATASTORE_COMPRESSION:
+            raise ValueError(f"unknown compression {compression!r} (use one of {', '.join(DATASTORE_COMPRESSION)})")
+        data_opts = {"dtype": np.int32, **DATASTORE_COMPRESSION[compression]}
         expt = Experiment.from_file(exptfile)
         phi, iy, ix = expt.scan_axes
         shape = (phi.size, iy.size, ix.size)
