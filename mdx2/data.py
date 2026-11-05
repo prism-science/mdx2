@@ -769,26 +769,31 @@ class ImageSeries:
     def index(self, miller_index, mask=None):
         """Table of unmasked pixels with their Miller indices. mask: boolean array (True = excluded) or a function of
         the regridded Miller indices returning one (dynamic masks, see mdx2.geometry.PeakMask.for_chunk)."""
-        mi = miller_index.regrid(self.phi, self.iy, self.ix)
+        P = profiling.PROFILER
+        with P.step("regrid"):
+            mi = miller_index.regrid(self.phi, self.iy, self.ix)
         if callable(mask):
-            mask = mask(mi)
-        phi, iy, ix = np.meshgrid(self.phi, self.iy, self.ix, indexing="ij")
-        # HACK to get this the right shape...
-        exposure_times = np.tile(self.exposure_times, (self.iy.size, self.ix.size, 1))
-        exposure_times = np.moveaxis(exposure_times, 2, 0)
-        msk = self.data != self._maskval
-        if mask is not None:
-            msk = msk & ~mask  # mask is true when pixels are excluded
-        return HKLTable(
-            mi.h[msk],
-            mi.k[msk],
-            mi.l[msk],
-            phi=phi[msk],
-            iy=iy[msk],
-            ix=ix[msk],
-            counts=self.data[msk],
-            seconds=exposure_times[msk],
-        )
+            with P.step("mask"):
+                mask = mask(mi)
+        with P.step("select"):
+            phi, iy, ix = np.meshgrid(self.phi, self.iy, self.ix, indexing="ij")
+            # HACK to get this the right shape...
+            exposure_times = np.tile(self.exposure_times, (self.iy.size, self.ix.size, 1))
+            exposure_times = np.moveaxis(exposure_times, 2, 0)
+            msk = self.data != self._maskval
+            if mask is not None:
+                msk = msk & ~mask  # mask is true when pixels are excluded
+            tab = HKLTable(
+                mi.h[msk],
+                mi.k[msk],
+                mi.l[msk],
+                phi=phi[msk],
+                iy=iy[msk],
+                ix=ix[msk],
+                counts=self.data[msk],
+                seconds=exposure_times[msk],
+            )
+        return tab
 
 
 # SOME UTILITY FUNCTIONS USED ABOVE

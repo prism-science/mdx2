@@ -10,6 +10,7 @@ from joblib import Parallel, delayed
 from loguru import logger
 from simple_parsing import field
 
+from mdx2 import profiling
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLGrid, HKLTable
 from mdx2.geometry import load_mask
@@ -114,24 +115,63 @@ def calc_corrections(
     - Direct background from binned_image_series
     - Offset model contribution (if provided)
     """
+    P = profiling.PROFILER
     UB = crystal.ub_matrix
-    s = UB @ np.stack((tab.h, tab.k, tab.l))
-    tab.s = np.sqrt(np.sum(s * s, axis=0))
-    correction_factors = corrections.interpolate(tab.iy, tab.ix)
+    with P.step("s"):
+        s = UB @ np.stack((tab.h, tab.k, tab.l))
+        tab.s = np.sqrt(np.sum(s * s, axis=0))
+    with P.step("corrections_interp"):
+        correction_factors = corrections.interpolate(tab.iy, tab.ix)
     solid_angle = correction_factors["solid_angle"]
     solid_angle *= correction_factors["attenuation"]
     solid_angle *= correction_factors["polarization"]
     solid_angle *= correction_factors["efficiency"]
     tab.multiplicity = tab.pixels * correction_factors["d3s"] * np.prod(tab.ndiv) / np.linalg.det(UB)
-    b = scaling_model.interp(tab.phi) if scaling_model else 1.0
-    a = absorption_model.interp(tab.ix, tab.iy, tab.phi) if absorption_model else 1.0
-    d = detector_model.interp(tab.ix, tab.iy) if detector_model else 1.0
-    c = offset_model.interp(tab.s, tab.phi) if offset_model else 0.0
-    bg_rate = background.interpolate(tab.phi, tab.iy, tab.ix) if background else 0.0
+    with P.step("models"):
+        b = scaling_model.interp(tab.phi) if scaling_model else 1.0
+        a = absorption_model.interp(tab.ix, tab.iy, tab.phi) if absorption_model else 1.0
+        d = detector_model.interp(tab.ix, tab.iy) if detector_model else 1.0
+        c = offset_model.interp(tab.s, tab.phi) if offset_model else 0.0
+    with P.step("background"):
+        bg_rate = background.interpolate(tab.phi, tab.iy, tab.ix) if background else 0.0
     tab.scale = tab.seconds * solid_angle * a * b * d
     tab.background_counts = tab.seconds * (bg_rate + c * a * d * solid_angle)
-    tab = tab.to_asu(symmetry)
+    with P.step("to_asu"):
+        tab = tab.to_asu(symmetry)
     del tab.phi, tab.iy, tab.ix, tab.seconds, tab.s, tab.op, tab.pixels
+    return tab
+
+
+def reintegrate_chunk(
+    image_series, sl, miller_index, mask, ndiv, crystal, corrections, symmetry,
+    scaling_model=None, absorption_model=None, detector_model=None, offset_model=None, background=None,
+):  # fmt: skip
+    """Work done for one image chunk (slices sl): read, index (with the mask), bin, corrections.
+
+    Returns an HKLTable on the subdivided grid (asymmetric unit) with counts, pixels-weighted multiplicity, scale
+    and background_counts, or None if no pixel was integrated. Steps are recorded by mdx2.profiling when enabled.
+    """
+    P = profiling.PROFILER
+    with P.step("read"):
+        ims = image_series[sl]
+    with P.step("index"):
+        tab = ims.index(miller_index, mask=None if mask is None else mask.for_chunk(sl))
+    if len(tab) == 0:
+        return None  # signal that no pixels were integrated
+    with P.step("bin", rows=len(tab)):
+        tab.ndiv = ndiv
+        tab = tab.bin(count_name="pixels")
+        tab.phi /= tab.pixels
+        tab.iy /= tab.pixels
+        tab.ix /= tab.pixels
+    with P.step("corrections", rows=len(tab)):
+        tab = calc_corrections(
+            tab, crystal, corrections, symmetry, scaling_model, absorption_model, detector_model, offset_model,
+            background,
+        )  # fmt: skip
+        tab.h = tab.h.astype(np.float32)
+        tab.k = tab.k.astype(np.float32)
+        tab.l = tab.l.astype(np.float32)
     return tab
 
 
@@ -167,30 +207,10 @@ def run_reintegrate(params):
         mask.check_axes(image_series.phi, image_series.iy, image_series.ix)
 
     def intchunk(sl):
-        ims = image_series[sl]
-        tab = ims.index(miller_index, mask=None if mask is None else mask.for_chunk(sl))
-        if len(tab) == 0:
-            return None  # signal that no pixels were integrated
-        tab.ndiv = params.subdivide
-        tab = tab.bin(count_name="pixels")
-        tab.phi /= tab.pixels
-        tab.iy /= tab.pixels
-        tab.ix /= tab.pixels
-        tab = calc_corrections(
-            tab,
-            crystal,
-            corrections,
-            symmetry,
-            scaling_model,
-            absorption_model,
-            detector_model,
-            offset_model,
-            background,
-        )
-        tab.h = tab.h.astype(np.float32)
-        tab.k = tab.k.astype(np.float32)
-        tab.l = tab.l.astype(np.float32)
-        return tab
+        return reintegrate_chunk(
+            image_series, sl, miller_index, mask, params.subdivide, crystal, corrections, symmetry,
+            scaling_model, absorption_model, detector_model, offset_model, background,
+        )  # fmt: skip
 
     # TODO: check for memory limitations, consider using memory mapping for large datasets
 
