@@ -12,9 +12,9 @@ from simple_parsing import field
 
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLTable
+from mdx2.geometry import load_mask
 from mdx2.io import (
     loadobj,
-    nxload,  # mask is too big to read all at once?
     saveobj,
 )
 
@@ -57,18 +57,15 @@ def run_integrate(params):
 
     if maskfile is not None:
         logger.info("Loading mask...")
-        # Use nxload directly instead of loadobj because loadobj fails for very large arrays
-        nxs = nxload(maskfile)
-        mask = nxs.entry.mask.signal  # nxfield
+        mask = load_mask(maskfile)  # static (read per chunk) or dynamic (rebuilt per chunk)
+        mask.check_axes(IS.phi, IS.iy, IS.ix)
+        logger.info("Mask type: {}", type(mask).__name__)
     else:
         mask = None
 
     def intchunk(sl):
         ims = IS[sl]
-        if mask is not None:
-            tab = ims.index(MI, mask=mask[sl].nxdata)  # added nxdata to deal with NXfield wrapper
-        else:
-            tab = ims.index(MI)
+        tab = ims.index(MI, mask=None if mask is None else mask.for_chunk(sl))
         tab.ndiv = ndiv
         return tab.bin(count_name="pixels")
 

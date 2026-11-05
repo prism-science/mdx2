@@ -3,6 +3,7 @@ import numpy as np
 from nexusformat.nexus import NXdata, NXfield, NXgroup, NXsample
 
 from mdx2.dxtbx_machinery import Experiment
+from mdx2.io import loadobj, nxload
 from mdx2.utils import interp2, interp3, interp_g2g_trilinear
 
 
@@ -412,3 +413,148 @@ class Crystal:
 
     def __str__(self):
         return str(self.__dict__)
+
+
+def _ellipsoid_expression(peak_model, sigma_cutoff):
+    """numexpr string: True where the fractional offsets (h - round(h), ...) lie inside the peak model's contour.
+
+    d = W (dh - r0) with W = inv(sigma) (GaussianPeak.quadform_at_points); inside if |d|^2 < sigma_cutoff^2. All
+    constants are inlined, so the test is one pass over h, k, l without temporaries.
+    """
+    W = np.linalg.inv(peak_model.sigma)
+    r0 = np.asarray(peak_model.r0, dtype=float)
+    frac = [f"({v} - floor({v} + 0.5) - ({r!r}))" for v, r in zip("hkl", r0.tolist())]
+    d = ["(" + " + ".join(f"({w!r})*{f}" for w, f in zip(row.tolist(), frac)) + ")" for row in W]
+    return f"({d[0]}**2 + {d[1]}**2 + {d[2]}**2) < {float(sigma_cutoff) ** 2!r}"
+
+
+def peak_model_mask(h, k, l, symmetry, peak_model, sigma_cutoff):  # noqa: E741
+    """Pixels inside the peak model (sigma_cutoff contour) around allowed reflections, at fractional Miller indices.
+
+    The model part of mdx2.mask_peaks, shared by the static (--static) and dynamic masks so that they agree. The
+    ellipsoid test is one numexpr pass; the reflection conditions are evaluated (in integers, as
+    Symmetry.is_reflection) only at the few pixels inside an ellipsoid.
+    """
+    h, k, l = (np.asarray(a, dtype=np.float64) for a in (h, k, l))  # noqa: E741
+    # one numexpr thread: callers run this per chunk in parallel worker processes (no oversubscription)
+    nthreads = ne.set_num_threads(1)
+    try:
+        m = ne.evaluate(_ellipsoid_expression(peak_model, sigma_cutoff), local_dict={"h": h, "k": k, "l": l})
+    finally:
+        ne.set_num_threads(nthreads)
+    idx = np.nonzero(m)  # tuple of index arrays: works for any memory layout (numexpr may return a strided array)
+    if idx[0].size:
+        H, K, L = (np.round(a[idx]) for a in (h, k, l))
+        m[idx] = symmetry.is_reflection(H, K, L)
+    return m
+
+
+class PeakMask:
+    """Peak mask rebuilt chunk by chunk from the peak model, instead of stored pixel by pixel.
+
+    mask = model mask (peak_model_mask; inverted when bragg) OR extra pixels. The extra pixels are given as integer
+    (frame, iy, ix) indices on the image-series axes, sorted; mdx2.mask_peaks stores the count-threshold peak pixels
+    that the model does not cover. for_chunk(sl) returns a function of the chunk's regridded Miller indices (as
+    computed by ImageSeries.index), so no extra interpolation is needed.
+    """
+
+    FORMAT_VERSION = 1
+
+    def __init__(self, axes, symmetry, peak_model, sigma_cutoff, bragg=False, pixels=None):
+        self.axes = tuple(np.asarray(a) for a in axes)  # phi, iy, ix of the image series
+        self.symmetry = symmetry
+        self.peak_model = peak_model
+        self.sigma_cutoff = float(sigma_cutoff)
+        self.bragg = bool(bragg)
+        pixels = (
+            np.zeros((0, 3), dtype=np.int32) if pixels is None else np.asarray(pixels, dtype=np.int32).reshape(-1, 3)
+        )
+        order = np.lexsort((pixels[:, 2], pixels[:, 1], pixels[:, 0]))
+        self.pixels = pixels[order]
+
+    @property
+    def shape(self):
+        return tuple(a.size for a in self.axes)
+
+    def model_mask(self, h, k, l):  # noqa: E741
+        m = peak_model_mask(h, k, l, self.symmetry, self.peak_model, self.sigma_cutoff)
+        return ~m if self.bragg else m
+
+    def chunk_pixels(self, sl):
+        """Extra pixels inside the chunk sl = (frames, iy, ix) slices, as indices relative to the chunk."""
+        f = self.pixels[:, 0]
+        a, b = np.searchsorted(f, [sl[0].start, sl[0].stop])
+        p = self.pixels[a:b]
+        inside = (p[:, 1] >= sl[1].start) & (p[:, 1] < sl[1].stop) & (p[:, 2] >= sl[2].start) & (p[:, 2] < sl[2].stop)
+        p = p[inside]
+        return p[:, 0] - sl[0].start, p[:, 1] - sl[1].start, p[:, 2] - sl[2].start
+
+    def for_chunk(self, sl):
+        """Function mi -> boolean mask (True = excluded) for chunk sl, mi = miller_index.regrid(chunk axes)."""
+        sl = tuple(slice(*s.indices(n)) for s, n in zip(sl, self.shape))
+        extra = self.chunk_pixels(sl)
+
+        def mask(mi):
+            m = self.model_mask(mi.h, mi.k, mi.l)
+            m[extra] = True
+            return m
+
+        return mask
+
+    def check_axes(self, phi, iy, ix):
+        for name, a, b in zip(("phi", "iy", "ix"), self.axes, (phi, iy, ix)):
+            if a.shape != np.shape(b) or not np.allclose(a, b):
+                raise ValueError(f"mask does not match the image series ({name} axis differs)")
+
+    def to_nexus(self):
+        g = NXgroup(
+            name="mask",
+            phi=NXfield(self.axes[0], name="phi"),
+            iy=NXfield(self.axes[1], name="iy"),
+            ix=NXfield(self.axes[2], name="ix"),
+            sigma_cutoff=self.sigma_cutoff,
+            bragg=int(self.bragg),
+            pixels=NXfield(self.pixels, name="pixels"),
+        )
+        g["peak_model"] = self.peak_model.to_nexus()
+        g["symmetry"] = self.symmetry.to_nexus()
+        g.attrs["format_version"] = self.FORMAT_VERSION
+        return g
+
+    @staticmethod
+    def from_nexus(g):
+        version = int(g.attrs.get("format_version", 0))
+        if version != PeakMask.FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported PeakMask format version {version} (this mdx2 reads {PeakMask.FORMAT_VERSION})"
+            )
+        return PeakMask(
+            (g.phi.nxvalue, g.iy.nxvalue, g.ix.nxvalue),
+            Symmetry.from_nexus(g.symmetry),
+            GaussianPeak.from_nexus(g.peak_model),
+            g.sigma_cutoff.nxvalue,
+            bragg=bool(g.bragg.nxvalue),
+            pixels=g.pixels.nxvalue,
+        )
+
+
+class StaticMask:
+    """Pre-computed boolean mask (mdx2.mask_peaks --static, and all masks from earlier versions), read per chunk."""
+
+    def __init__(self, signal):
+        self.signal = signal  # NXfield; pickles as a reference to the file, so workers read only their chunk
+
+    def for_chunk(self, sl):
+        return self.signal[sl].nxdata
+
+    def check_axes(self, phi, iy, ix):
+        if tuple(self.signal.shape) != (len(phi), len(iy), len(ix)):
+            raise ValueError(f"mask shape {tuple(self.signal.shape)} does not match the image series")
+
+
+def load_mask(filename, name="mask"):
+    """Static (GridData) or dynamic (PeakMask) mask from mdx2.mask_peaks."""
+    g = nxload(filename)["entry/" + name]
+    if g.attrs.get("mdx2_class") == "PeakMask":
+        return loadobj(filename, name)
+    return StaticMask(g.signal)  # GridData: read lazily, the array may be very large

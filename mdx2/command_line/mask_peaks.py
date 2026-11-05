@@ -10,7 +10,7 @@ from loguru import logger
 from simple_parsing import field  # pip install simple-parsing
 
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
-from mdx2.geometry import GridData
+from mdx2.geometry import GridData, PeakMask, peak_model_mask
 from mdx2.io import loadobj, saveobj
 
 
@@ -26,6 +26,9 @@ class Parameters:
     logfile: str = "mdx2.mask_peaks.log"  # name of the log file
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
     bragg: bool = False  # create a Bragg peak mask instead
+    static: bool = False
+    """write the full boolean mask array (the format of mdx2 <= 1.0.5; slow and memory-intensive) instead of the
+    peak model and the peak pixels it does not cover, from which integrate / reintegrate rebuild the mask"""
 
     def __post_init__(self):
         """Validate sigma_cutoff parameter"""
@@ -50,19 +53,40 @@ def run_mask_peaks(params):
     GP = loadobj(peaks, "peak_model")
     P = loadobj(peaks, "peaks")
 
-    # initialize the mask using Peaks
+    if not params.static:
+        logger.info("Building a dynamic mask (peak model + peak pixels it does not cover)...")
+        if bragg:
+            pixels = None  # Bragg mask: model only, as in the static version
+        else:
+            # count-threshold peak pixels at their nearest grid indices (as Peaks.to_mask)
+            ind = np.stack(
+                [
+                    np.round(np.interp(v, ax, np.arange(ax.size))).astype(np.int64)
+                    for v, ax in ((P.phi, IS.phi), (P.iy, IS.iy), (P.ix, IS.ix))
+                ],
+                axis=1,
+            )
+            ind = np.unique(ind, axis=0)
+            # drop the pixels the model mask covers; keep a margin at the contour, because the indices are
+            # interpolated at points here and on the chunk grid in integrate (both trilinear; differences ~1e-12)
+            h, k, l = MI.interpolate(IS.phi[ind[:, 0]], IS.iy[ind[:, 1]], IS.ix[ind[:, 2]])
+            covered = peak_model_mask(h, k, l, Symm, GP, sigma_cutoff * (1 - 1e-6))
+            pixels = ind[~covered]
+            logger.info(
+                "Peak pixels: {}, covered by the peak model: {}, stored: {}", len(ind), int(covered.sum()), len(pixels)
+            )
+        mask = PeakMask((IS.phi, IS.iy, IS.ix), Symm, GP, sigma_cutoff, bragg=bragg, pixels=pixels)
+        logger.info("Saving mask to {}...", outfile)
+        saveobj(mask, outfile, name="mask", append=False)
+        logger.info("Mask creation completed successfully")
+        return
+
+    # static mask: the full boolean array
     mask = np.zeros(IS.shape, dtype="bool")
 
     def maskchunk(sl):
         MIdense = MI.regrid(IS.phi[sl[0]], IS.iy[sl[1]], IS.ix[sl[2]])
-        H = np.round(MIdense.h)
-        K = np.round(MIdense.k)
-        L = np.round(MIdense.l)
-        dh = MIdense.h - H
-        dk = MIdense.k - K
-        dl = MIdense.l - L
-        isrefl = Symm.is_reflection(H, K, L)
-        return isrefl & GP.mask(dh, dk, dl, sigma_cutoff=sigma_cutoff)
+        return peak_model_mask(MIdense.h, MIdense.k, MIdense.l, Symm, GP, sigma_cutoff)
 
     slices = list(IS.chunk_slice_iterator())
     logger.info("Computing peak mask for {} image chunks (requested n_jobs: {})...", len(slices), nproc)
