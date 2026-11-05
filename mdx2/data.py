@@ -224,10 +224,8 @@ class HKLTable:
                     f"tabs[0].ndiv={ndiv}, tabs[{j}].ndiv={tabs[j].ndiv}"
                 )
 
-        # Find data keys common to all tables
-        data_keys = set(tabs[0]._data_keys)
-        for j in range(1, len(tabs)):
-            data_keys &= set(tabs[j]._data_keys)
+        # Data keys common to all tables, in the order of the first one
+        data_keys = [k for k in tabs[0]._data_keys if all(k in t._data_keys for t in tabs[1:])]
 
         def concat(key):
             return np.concatenate([tab.__dict__[key] for tab in tabs])

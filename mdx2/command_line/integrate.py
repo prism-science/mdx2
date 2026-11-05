@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
-import pandas as pd
 from joblib import Parallel, delayed
 from loguru import logger
 from simple_parsing import field
@@ -70,18 +69,30 @@ def group_partials(tabs, max_degrees):
     return df
 
 
+def to_output_table(df, ndiv):
+    """integrated.nxs table from group_partials' DataFrame: columns h, k, l, n, pixels, phi, iy, ix, counts, seconds
+    in their output dtypes."""
+    hkl_table = HKLTable.from_frame(df)
+    hkl_table.ndiv = ndiv  # lost in conversion to/from dataframe
+    for c in ("h", "k", "l", "phi", "ix", "iy", "seconds"):
+        setattr(hkl_table, c, getattr(hkl_table, c).astype(np.float32))
+    hkl_table.counts = hkl_table.counts.astype(np.int32)
+    hkl_table.pixels = hkl_table.pixels.astype(np.int32)
+    return hkl_table
+
+
 def integrate_column(image_series, slices, miller_index, mask, ndiv, max_degrees):
     """Fast-engine task: bin every chunk of one column (one detector module), group within the column.
-    Returns (DataFrame or None, number of partial rows, seconds per step)."""
+    Returns (output table or None, number of partial rows, seconds per step)."""
     timer = {}
     tabs = [bin_chunk(image_series, sl, miller_index, mask, ndiv, timer=timer) for sl in slices]
     tabs = [t for t in tabs if t is not None]
     if not tabs:
         return None, 0, timer
     t0 = time.perf_counter()
-    df = group_partials(tabs, max_degrees)
+    out = to_output_table(group_partials(tabs, max_degrees), ndiv)
     timer["group"] = time.perf_counter() - t0
-    return df, sum(len(t) for t in tabs), timer
+    return out, sum(len(t) for t in tabs), timer
 
 
 def run_integrate(params):
@@ -164,28 +175,16 @@ def run_integrate(params):
         P.add("tasks", wall)
         log_timers([r[2] for r in results], wall, params.profile)
         t0 = clock()
-        df = pd.concat(frames)
+        hkl_table = HKLTable.concatenate(frames)  # tables already in output form
         voxels_before = sum(r[1] for r in results)
         P.add("concatenate", clock() - t0)
 
-    voxels_after = len(df)
-    logger.info("Binned from {} to {} voxels", voxels_before, voxels_after)
+    if params.engine == "reference":
+        t0 = clock()
+        hkl_table = to_output_table(df, ndiv)
+        P.add("to table", clock() - t0)
+    logger.info("Binned from {} to {} voxels", voxels_before, len(hkl_table))
 
-    t0 = clock()
-    hkl_table = HKLTable.from_frame(df)
-    hkl_table.ndiv = ndiv  # lost in conversion to/from dataframe
-
-    hkl_table.h = hkl_table.h.astype(np.float32)
-    hkl_table.k = hkl_table.k.astype(np.float32)
-    hkl_table.l = hkl_table.l.astype(np.float32)
-    hkl_table.phi = hkl_table.phi.astype(np.float32)
-    hkl_table.ix = hkl_table.ix.astype(np.float32)
-    hkl_table.iy = hkl_table.iy.astype(np.float32)
-    hkl_table.seconds = hkl_table.seconds.astype(np.float32)
-    hkl_table.counts = hkl_table.counts.astype(np.int32)
-    hkl_table.pixels = hkl_table.pixels.astype(np.int32)
-
-    P.add("to table", clock() - t0)
     t0 = clock()
     logger.info("Saving integrated data to {}...", outfile)
     saveobj(hkl_table, outfile, name="hkl_table", append=False)

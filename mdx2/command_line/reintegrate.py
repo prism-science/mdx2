@@ -264,24 +264,31 @@ def run_reintegrate(params):
     # TODO: check for memory limitations, consider using memory mapping for large datasets
 
     P.add("load", clock() - t_load)
-    t_grid = clock()
-    logger.info("Calculating Miller index range for output grid...")
-    hkl = HKLTable(miller_index.h.ravel(), miller_index.k.ravel(), miller_index.l.ravel(), ndiv=params.subdivide)
-    hkl = hkl.to_asu(symmetry)
-    array_range = (min(hkl.H.min(), 0), hkl.H.max(), min(hkl.K.min(), 0), hkl.K.max(), min(hkl.L.min(), 0), hkl.L.max())
-    array_size = tuple(hi - lo + 1 for lo, hi in zip(array_range[::2], array_range[1::2]))
-    array_ori = tuple(lo / s for lo, s in zip(array_range[::2], params.subdivide))
-    logger.info("Output grid size: {}", array_size)
-    logger.info("Allocating empty output arrays...")
-    data_arrays = {
-        "counts": np.zeros(array_size, dtype=np.uint32),
-        "background_counts": np.zeros(array_size, dtype=np.float32),
-        "scale": np.zeros(array_size, dtype=np.float32),
-        "multiplicity": np.zeros(array_size, dtype=np.float32),
-    }
-    grid = HKLGrid(data_arrays, ndiv=params.subdivide, ori=array_ori)
 
-    P.add("grid setup", clock() - t_grid)
+    def make_grid(array_range):
+        """Empty output arrays covering array_range = (Hmin, Hmax, Kmin, Kmax, Lmin, Lmax) (subdivided indices)."""
+        array_size = tuple(hi - lo + 1 for lo, hi in zip(array_range[::2], array_range[1::2]))
+        array_ori = tuple(lo / s for lo, s in zip(array_range[::2], params.subdivide))
+        logger.info("Output grid size: {}", array_size)
+        data_arrays = {
+            "counts": np.zeros(array_size, dtype=np.uint32),
+            "background_counts": np.zeros(array_size, dtype=np.float32),
+            "scale": np.zeros(array_size, dtype=np.float32),
+            "multiplicity": np.zeros(array_size, dtype=np.float32),
+        }
+        return HKLGrid(data_arrays, ndiv=params.subdivide, ori=array_ori)
+
+    t_grid = clock()
+    if params.engine == "reference":
+        logger.info("Calculating Miller index range for output grid...")
+        hkl = HKLTable(miller_index.h.ravel(), miller_index.k.ravel(), miller_index.l.ravel(), ndiv=params.subdivide)
+        hkl = hkl.to_asu(symmetry)
+        grid = make_grid(
+            (min(hkl.H.min(), 0), hkl.H.max(), min(hkl.K.min(), 0), hkl.K.max(), min(hkl.L.min(), 0), hkl.L.max())
+        )
+        del hkl
+    if params.engine == "reference":
+        P.add("grid setup", clock() - t_grid)
     t_tasks = clock()
     if params.engine == "reference":
         slices = list(image_series.chunk_slice_iterator())
@@ -293,6 +300,7 @@ def run_reintegrate(params):
                 if tab is None:
                     continue
                 grid.accumulate_from_table(tab, resize=False)
+        P.add("tasks + accumulate", clock() - t_tasks)
     else:
         columns = chunk_columns(image_series)
         logger.info(
@@ -314,14 +322,30 @@ def run_reintegrate(params):
             log_parallel_backend(parallel)
             # each task carries only its part of the Miller-index grid
             tasks = (delayed(intcolumn)(c, MillerIndexRegion.for_column(miller_index, c)) for c in columns)
+            tabs = []
             for tab, timer in parallel(tasks):
                 timers.append(timer)
                 if tab is not None:
-                    grid.accumulate_from_table(tab, resize=False)
+                    tabs.append(tab)
+        P.add("tasks", time.perf_counter() - t0)
         log_timers(timers, time.perf_counter() - t0, params.profile)
+        # output grid from the range of the results (the reference engine maps the whole Miller-index grid to the
+        # asymmetric unit for this); origin included, as there
+        t1 = clock()
+        idx = [
+            [np.round(np.asarray(getattr(t, c)) * n).astype(np.int64) for t in tabs]
+            for c, n in zip("hkl", params.subdivide)
+        ]
+        rng = []
+        for parts in idx:
+            rng += [min(0, *(int(p.min()) for p in parts)), max(int(p.max()) for p in parts)]
+        grid = make_grid(tuple(rng))
+        for tab in tabs:
+            grid.accumulate_from_table(tab, resize=False)
+        del tabs, idx
+        P.add("grid setup + accumulate", clock() - t1)
     logger.info("Reintegration completed")
 
-    P.add("tasks + accumulate", clock() - t_tasks)
     t_tab = clock()
     logger.info("Converting grid to sparse table...")
     hkl_table = grid.to_table(sparse=True)
