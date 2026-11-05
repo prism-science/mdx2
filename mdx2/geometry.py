@@ -415,10 +415,10 @@ class Crystal:
         return str(self.__dict__)
 
 
-def _ellipsoid_expression(peak_model, sigma_cutoff):
-    """numexpr string: True where the fractional offsets (h - round(h), ...) lie inside the peak model's contour.
+def peak_expression(peak_model, sigma_cutoff):
+    """numexpr string, True where the fractional offsets (h - round(h), ...) lie inside the peak model's contour.
 
-    d = W (dh - r0) with W = inv(sigma) (GaussianPeak.quadform_at_points); inside if |d|^2 < sigma_cutoff^2. All
+    d = W (dh - r0) with W = inv(sigma) (as GaussianPeak.quadform_at_points); inside if |d|^2 < sigma_cutoff^2. All
     constants are inlined, so the test is one pass over h, k, l without temporaries.
     """
     W = np.linalg.inv(peak_model.sigma)
@@ -428,62 +428,80 @@ def _ellipsoid_expression(peak_model, sigma_cutoff):
     return f"({d[0]}**2 + {d[1]}**2 + {d[2]}**2) < {float(sigma_cutoff) ** 2!r}"
 
 
-def peak_model_mask(h, k, l, symmetry, peak_model, sigma_cutoff):  # noqa: E741
-    """Pixels inside the peak model (sigma_cutoff contour) around allowed reflections, at fractional Miller indices.
+def evaluate_peak_mask(h, k, l, peak_expr, reflection_conditions):  # noqa: E741
+    """reflection_conditions(round(h), round(k), round(l)) AND peak_expr(h, k, l), at fractional Miller indices.
 
-    The model part of mdx2.mask_peaks, shared by the static (--static) and dynamic masks so that they agree. The
-    ellipsoid test is one numexpr pass; the reflection conditions are evaluated (in integers, as
-    Symmetry.is_reflection) only at the few pixels inside an ellipsoid.
+    The peak test is one numexpr pass; the reflection conditions are evaluated in integers (as
+    Symmetry.is_reflection) only at the few pixels that pass it.
     """
     h, k, l = (np.asarray(a, dtype=np.float64) for a in (h, k, l))  # noqa: E741
     # one numexpr thread: callers run this per chunk in parallel worker processes (no oversubscription)
     nthreads = ne.set_num_threads(1)
     try:
-        m = ne.evaluate(_ellipsoid_expression(peak_model, sigma_cutoff), local_dict={"h": h, "k": k, "l": l})
+        m = ne.evaluate(peak_expr, local_dict={"h": h, "k": k, "l": l})
+        idx = np.nonzero(m)  # index arrays: work for any memory layout (numexpr may return a strided array)
+        if idx[0].size:
+            H, K, L = (np.round(a[idx]).astype(int) for a in (h, k, l))
+            m[idx] = ne.evaluate(reflection_conditions, local_dict={"h": H, "k": K, "l": L})
     finally:
         ne.set_num_threads(nthreads)
-    idx = np.nonzero(m)  # tuple of index arrays: works for any memory layout (numexpr may return a strided array)
-    if idx[0].size:
-        H, K, L = (np.round(a[idx]) for a in (h, k, l))
-        m[idx] = symmetry.is_reflection(H, K, L)
     return m
 
 
-class PeakMask:
-    """Peak mask rebuilt chunk by chunk from the peak model, instead of stored pixel by pixel.
+def peak_model_mask(h, k, l, symmetry, peak_model, sigma_cutoff):  # noqa: E741
+    """Pixels inside the peak model (sigma_cutoff contour) around allowed reflections: the model part of
+    mdx2.mask_peaks, shared by the static (--static) and dynamic masks so that they agree."""
+    return evaluate_peak_mask(h, k, l, peak_expression(peak_model, sigma_cutoff), symmetry.reflection_conditions)
 
-    mask = model mask (peak_model_mask; inverted when bragg) OR extra pixels. The extra pixels are given as integer
-    (frame, iy, ix) indices on the image-series axes, sorted; mdx2.mask_peaks stores the count-threshold peak pixels
-    that the model does not cover. for_chunk(sl) returns a function of the chunk's regridded Miller indices (as
-    computed by ImageSeries.index), so no extra interpolation is needed.
+
+class PeakMask:
+    """Peak mask stored as two numexpr expressions and a list of pixels, rebuilt chunk by chunk.
+
+    At each pixel, with fractional Miller indices h, k, l:
+        excluded = (bragg XOR [reflection_conditions(round(h), round(k), round(l)) AND peak_expression(h, k, l)])
+                   OR (frame, iy, ix) in pixels
+    peak_expression is built from the peak model (peak_r0, peak_sigma) and sigma_cutoff, which are stored alongside
+    for reference; the mask is evaluated from the expressions. pixels: integer (frame, iy, ix) indices on the image
+    series (the count-threshold peak pixels the peak model does not cover), sorted. shape: the image-series shape.
+    for_chunk(sl) returns a function of the chunk's regridded Miller indices (as computed by ImageSeries.index).
     """
 
     FORMAT_VERSION = 1
+    DESCRIPTION = (
+        "excluded = (bragg XOR [reflection_conditions(round(h), round(k), round(l)) AND peak_expression(h, k, l)]) "
+        "OR (frame, iy, ix) in pixels; numexpr syntax; h, k, l = fractional Miller indices at each pixel"
+    )
 
-    def __init__(self, axes, symmetry, peak_model, sigma_cutoff, bragg=False, pixels=None):
-        self.axes = tuple(np.asarray(a) for a in axes)  # phi, iy, ix of the image series
-        self.symmetry = symmetry
-        self.peak_model = peak_model
-        self.sigma_cutoff = float(sigma_cutoff)
+    def __init__(
+        self, peak_expression, reflection_conditions, shape, pixels=None, bragg=False,
+        peak_r0=None, peak_sigma=None, sigma_cutoff=None,
+    ):  # fmt: skip
+        self.peak_expression = str(peak_expression)
+        self.reflection_conditions = str(reflection_conditions)
+        self.shape = tuple(int(n) for n in shape)
         self.bragg = bool(bragg)
-        pixels = (
-            np.zeros((0, 3), dtype=np.int32) if pixels is None else np.asarray(pixels, dtype=np.int32).reshape(-1, 3)
-        )
-        order = np.lexsort((pixels[:, 2], pixels[:, 1], pixels[:, 0]))
-        self.pixels = pixels[order]
+        if pixels is None:
+            pixels = np.zeros((0, 3), dtype=np.int32)
+        pixels = np.asarray(pixels, dtype=np.int32).reshape(-1, 3)
+        self.pixels = pixels[np.lexsort((pixels[:, 2], pixels[:, 1], pixels[:, 0]))]
+        self.peak_r0 = None if peak_r0 is None else np.asarray(peak_r0, dtype=float)
+        self.peak_sigma = None if peak_sigma is None else np.asarray(peak_sigma, dtype=float)
+        self.sigma_cutoff = None if sigma_cutoff is None else float(sigma_cutoff)
 
-    @property
-    def shape(self):
-        return tuple(a.size for a in self.axes)
+    @staticmethod
+    def from_peak_model(symmetry, peak_model, sigma_cutoff, shape, pixels=None, bragg=False):
+        return PeakMask(
+            peak_expression(peak_model, sigma_cutoff), symmetry.reflection_conditions, shape, pixels=pixels,
+            bragg=bragg, peak_r0=peak_model.r0, peak_sigma=peak_model.sigma, sigma_cutoff=sigma_cutoff,
+        )  # fmt: skip
 
     def model_mask(self, h, k, l):  # noqa: E741
-        m = peak_model_mask(h, k, l, self.symmetry, self.peak_model, self.sigma_cutoff)
+        m = evaluate_peak_mask(h, k, l, self.peak_expression, self.reflection_conditions)
         return ~m if self.bragg else m
 
     def chunk_pixels(self, sl):
         """Extra pixels inside the chunk sl = (frames, iy, ix) slices, as indices relative to the chunk."""
-        f = self.pixels[:, 0]
-        a, b = np.searchsorted(f, [sl[0].start, sl[0].stop])
+        a, b = np.searchsorted(self.pixels[:, 0], [sl[0].start, sl[0].stop])
         p = self.pixels[a:b]
         inside = (p[:, 1] >= sl[1].start) & (p[:, 1] < sl[1].stop) & (p[:, 2] >= sl[2].start) & (p[:, 2] < sl[2].stop)
         p = p[inside]
@@ -502,40 +520,35 @@ class PeakMask:
         return mask
 
     def check_axes(self, phi, iy, ix):
-        for name, a, b in zip(("phi", "iy", "ix"), self.axes, (phi, iy, ix)):
-            if a.shape != np.shape(b) or not np.allclose(a, b):
-                raise ValueError(f"mask does not match the image series ({name} axis differs)")
+        if self.shape != (len(phi), len(iy), len(ix)):
+            raise ValueError(f"mask shape {self.shape} does not match the image series {(len(phi), len(iy), len(ix))}")
 
     def to_nexus(self):
         g = NXgroup(
             name="mask",
-            phi=NXfield(self.axes[0], name="phi"),
-            iy=NXfield(self.axes[1], name="iy"),
-            ix=NXfield(self.axes[2], name="ix"),
-            sigma_cutoff=self.sigma_cutoff,
+            peak_expression=self.peak_expression,
+            reflection_conditions=self.reflection_conditions,
             bragg=int(self.bragg),
             pixels=NXfield(self.pixels, name="pixels"),
+            shape=np.array(self.shape, dtype=np.int64),
         )
-        g["peak_model"] = self.peak_model.to_nexus()
-        g["symmetry"] = self.symmetry.to_nexus()
+        for name in ("peak_r0", "peak_sigma", "sigma_cutoff"):
+            if getattr(self, name) is not None:
+                g[name] = getattr(self, name)
         g.attrs["format_version"] = self.FORMAT_VERSION
+        g.attrs["description"] = self.DESCRIPTION
         return g
 
     @staticmethod
     def from_nexus(g):
         version = int(g.attrs.get("format_version", 0))
         if version != PeakMask.FORMAT_VERSION:
-            raise ValueError(
-                f"unsupported PeakMask format version {version} (this mdx2 reads {PeakMask.FORMAT_VERSION})"
-            )
+            raise ValueError(f"unsupported PeakMask format version {version} (supported: {PeakMask.FORMAT_VERSION})")
+        opt = {n: g[n].nxvalue for n in ("peak_r0", "peak_sigma", "sigma_cutoff") if n in g}
         return PeakMask(
-            (g.phi.nxvalue, g.iy.nxvalue, g.ix.nxvalue),
-            Symmetry.from_nexus(g.symmetry),
-            GaussianPeak.from_nexus(g.peak_model),
-            g.sigma_cutoff.nxvalue,
-            bragg=bool(g.bragg.nxvalue),
-            pixels=g.pixels.nxvalue,
-        )
+            g.peak_expression.nxvalue, g.reflection_conditions.nxvalue, g.shape.nxvalue,
+            pixels=g.pixels.nxvalue, bragg=bool(g.bragg.nxvalue), **opt,
+        )  # fmt: skip
 
 
 class StaticMask:

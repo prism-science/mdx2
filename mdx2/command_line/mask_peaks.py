@@ -75,7 +75,7 @@ def run_mask_peaks(params):
             logger.info(
                 "Peak pixels: {}, covered by the peak model: {}, stored: {}", len(ind), int(covered.sum()), len(pixels)
             )
-        mask = PeakMask((IS.phi, IS.iy, IS.ix), Symm, GP, sigma_cutoff, bragg=bragg, pixels=pixels)
+        mask = PeakMask.from_peak_model(Symm, GP, sigma_cutoff, IS.shape, pixels=pixels, bragg=bragg)
         logger.info("Saving mask to {}...", outfile)
         saveobj(mask, outfile, name="mask", append=False)
         logger.info("Mask creation completed successfully")

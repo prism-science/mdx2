@@ -102,8 +102,35 @@ def test_mask_shape_mismatch(sweep):
     tmp_path, geom, dat, pk = sweep
     _, fd = make_masks(tmp_path, geom, dat, pk)
     D = load_mask(fd)
+    phi, iy, ix = (np.arange(n) for n in D.shape)
+    D.check_axes(phi, iy, ix)
     with pytest.raises(ValueError, match="does not match"):
-        D.check_axes(D.axes[0][:-1], D.axes[1], D.axes[2])
+        D.check_axes(phi[:-1], iy, ix)
+
+
+def test_file_is_self_describing(sweep):
+    """The mask file holds the numexpr expressions; evaluating them by hand reproduces the mask."""
+    import numexpr as ne  # noqa: PLC0415
+
+    from mdx2.io import nxload  # noqa: PLC0415
+
+    tmp_path, geom, dat, pk = sweep
+    _, fd = make_masks(tmp_path, geom, dat, pk)
+    g = nxload(fd)["entry/mask"]
+    assert "excluded = " in g.attrs["description"] and g.sigma_cutoff.nxvalue == 2.0
+    D = load_mask(fd)
+    mi, ims = loadobj(geom, "miller_index"), loadobj(dat, "image_series")
+    sl = next(iter(ims.chunk_slice_iterator()))
+    m = mi.regrid(ims.phi[sl[0]], ims.iy[sl[1]], ims.ix[sl[2]])
+    h, k, l = m.h, m.k, m.l  # noqa: E741
+    inside = ne.evaluate(str(g.peak_expression.nxvalue))
+    H, K, L = (np.round(a).astype(int) for a in (h, k, l))
+    allowed = ne.evaluate(str(g.reflection_conditions.nxvalue), local_dict={"h": H, "k": K, "l": L})
+    by_hand = allowed & inside
+    for f, y, x in g.pixels.nxvalue:
+        if all(s.start <= v < s.stop for s, v in zip(sl, (f, y, x))):
+            by_hand[f - sl[0].start, y - sl[1].start, x - sl[2].start] = True
+    np.testing.assert_array_equal(by_hand, D.for_chunk(sl)(m))
 
 
 def test_ellipsoid_expression_matches_quadform():
