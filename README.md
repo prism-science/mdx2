@@ -30,6 +30,7 @@ Faster `mdx2.scale`: the same alternating-least-squares algorithm, with compiled
 - Faster grouping of symmetry-equivalent observations (`HKLTable.unique`), used by `mdx2.scale` and `mdx2.merge`.
 - Scale files are unchanged, so downstream steps (`mdx2.merge`, `mdx2.reintegrate`, reports) work as before.
 - New dependencies: `numba`, `threadpoolctl`, `psutil`.
+- `env.yaml` no longer pins Python to 3.10 (dxtbx releases after 3.24, needed for recent Eiger files, are built for Python >= 3.11).
 
 ### Version 1.0.5
 
