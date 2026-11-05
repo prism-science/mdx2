@@ -6,6 +6,7 @@ then mdx2.integrate with each mask must give the same table.
 
 import numpy as np
 import pytest
+from nexusformat.nexus import NXfield
 
 from mdx2.command_line.integrate import Parameters as IntParams
 from mdx2.command_line.integrate import run_integrate
@@ -40,8 +41,8 @@ def symmetry():
     )  # fmt: skip
 
 
-@pytest.fixture
-def sweep(tmp_path):
+def write_sweep(tmp_path, chunks=None):
+    """Synthetic sweep written to files; chunks: chunk shape of the image data (default: chosen by nexusformat)."""
     rng = np.random.default_rng(1)
     phi, iy, ix = np.arange(0, 8, 0.5), np.arange(60.0), np.arange(70.0)
     # Miller-index lookup grid (coarser than the images, as mdx2.import_geometry), linear in (phi, iy, ix)
@@ -58,7 +59,7 @@ def sweep(tmp_path):
     data[rng.random(data.shape) < 0.002] = -1  # detector mask value
     hot = rng.random(data.shape) < 0.001
     data[hot] = 500
-    ims = ImageSeries(phi, iy, ix, data, np.full(phi.size, 0.1))
+    ims = ImageSeries(phi, iy, ix, data if chunks is None else NXfield(data, chunks=chunks), np.full(phi.size, 0.1))
     peaks = Peaks.where(hot, phi, iy, ix)
     geom, dat, pk = (str(tmp_path / f) for f in ("geometry.nxs", "data.nxs", "peaks.nxs"))
     saveobj(mi, geom, name="miller_index", append=False)
@@ -94,6 +95,11 @@ def sweep(tmp_path):
     saveobj(peak, pk, name="peak_model", append=False)
     saveobj(peaks, pk, name="peaks", append=True)
     return tmp_path, geom, dat, pk
+
+
+@pytest.fixture
+def sweep(tmp_path):
+    return write_sweep(tmp_path)
 
 
 def make_masks(tmp_path, geom, dat, pk, bragg=False):

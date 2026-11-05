@@ -2,6 +2,7 @@
 Reintegrate on a different grid, applying corrections, scaling, and merging symmetry-equivalent observations.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
@@ -14,11 +15,13 @@ from mdx2 import profiling
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import HKLGrid, HKLTable
 from mdx2.geometry import load_mask
+from mdx2.integration import bin_chunk, chunk_columns, log_timers
 from mdx2.io import (
     loadobj,
     nxload,  # mask is too big to read all at once?
     saveobj,
 )
+from mdx2.parallel import available_cpus
 
 # TODO: implement splitting
 # TODO: unify with mdx2.integrate, mdx2.correct
@@ -40,12 +43,19 @@ class Parameters:
     scale: Optional[str] = None  # NeXus file with scaling model
     background: Optional[str] = None  # NeXus file with background binned_image_series
     nproc: int = 1  # number of parallel processes (or 1 for sequential, -1 for all CPUs, -N for all but N+1)
+    engine: str = "fast"
+    """"fast" (default): one task per column of chunks along phi (a detector module with the default chunking),
+    compiled per-chunk binning, sums accumulated in the task; "reference": mdx2 <= 1.0.5 (one task per chunk; kept
+    for one release)"""
+    profile: bool = False  # log time per step, summed over the workers (fast engine)
     output: Literal["counts", "intensity"] = "counts"  # counts or intensity
     outfile: str = "reintegrated.nxs"  # name of the output data
     logfile: str = "mdx2.reintegrate.log"  # name of the log file
 
     def __post_init__(self):
         """Validate subdivide parameter"""
+        if self.engine not in ("fast", "reference"):
+            raise ValueError(f"Unknown engine {self.engine!r} (use 'fast' or 'reference')")
         for i, div in enumerate(self.subdivide):
             if div <= 0:
                 raise ValueError(f"subdivide[{i}] must be > 0, got {div}")
@@ -175,6 +185,42 @@ def reintegrate_chunk(
     return tab
 
 
+def reintegrate_column(
+    image_series, slices, miller_index, mask, ndiv, crystal, corrections, symmetry,
+    scaling_model=None, absorption_model=None, detector_model=None, offset_model=None, background=None,
+):  # fmt: skip
+    """Fast-engine task: one column of chunks (one detector module). Compiled per-chunk binning (bin_chunk), the
+    corrections per chunk, sums over the column by voxel (asymmetric unit). Returns (HKLTable or None, seconds per
+    step)."""
+    timer = {}
+    tabs = []
+    for sl in slices:
+        tab = bin_chunk(image_series, sl, miller_index, mask, ndiv, timer=timer)
+        if tab is None:
+            continue
+        t0 = time.perf_counter()
+        tab.phi /= tab.pixels
+        tab.iy /= tab.pixels
+        tab.ix /= tab.pixels
+        tab = calc_corrections(
+            tab, crystal, corrections, symmetry, scaling_model, absorption_model, detector_model, offset_model,
+            background,
+        )  # fmt: skip
+        timer["corrections"] = timer.get("corrections", 0.0) + time.perf_counter() - t0
+        tabs.append(tab)
+    if not tabs:
+        return None, timer
+    t0 = time.perf_counter()
+    tab = HKLTable.concatenate(tabs).bin(
+        column_names=["counts", "background_counts", "scale", "multiplicity"], count_name=None
+    )
+    tab.h = tab.h.astype(np.float32)
+    tab.k = tab.k.astype(np.float32)
+    tab.l = tab.l.astype(np.float32)
+    timer["accumulate"] = time.perf_counter() - t0
+    return tab, timer
+
+
 def run_reintegrate(params):
     logger.info("Loading geometry and image data...")
     miller_index = loadobj(params.geom, "miller_index")
@@ -230,15 +276,40 @@ def run_reintegrate(params):
     }
     grid = HKLGrid(data_arrays, ndiv=params.subdivide, ori=array_ori)
 
-    slices = list(image_series.chunk_slice_iterator())
-    logger.info("Reintegrating {} image chunks (requested n_jobs: {})...", len(slices), params.nproc)
-    with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
-        log_parallel_backend(parallel)
-        tab_chunk = parallel(delayed(intchunk)(sl) for sl in slices)
-        for tab in tab_chunk:
-            if tab is None:
-                continue
-            grid.accumulate_from_table(tab, resize=False)
+    if params.engine == "reference":
+        slices = list(image_series.chunk_slice_iterator())
+        logger.info("Reintegrating {} image chunks (requested n_jobs: {})...", len(slices), params.nproc)
+        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
+            log_parallel_backend(parallel)
+            tab_chunk = parallel(delayed(intchunk)(sl) for sl in slices)
+            for tab in tab_chunk:
+                if tab is None:
+                    continue
+                grid.accumulate_from_table(tab, resize=False)
+    else:
+        columns = chunk_columns(image_series)
+        logger.info(
+            "Reintegrating {} chunk columns (detector modules) of {} chunks each (requested n_jobs: {})...",
+            len(columns), len(columns[0]), params.nproc,
+        )  # fmt: skip
+        if params.nproc > len(columns) or (params.nproc < 0 and available_cpus() > len(columns)):
+            logger.info("At most {} processes are used (one per chunk column)", len(columns))
+
+        def intcolumn(slices):
+            return reintegrate_column(
+                image_series, slices, miller_index, mask, params.subdivide, crystal, corrections, symmetry,
+                scaling_model, absorption_model, detector_model, offset_model, background,
+            )  # fmt: skip
+
+        t0 = time.perf_counter()
+        timers = []
+        with Parallel(n_jobs=params.nproc, verbose=10, return_as="generator_unordered") as parallel:
+            log_parallel_backend(parallel)
+            for tab, timer in parallel(delayed(intcolumn)(c) for c in columns):
+                timers.append(timer)
+                if tab is not None:
+                    grid.accumulate_from_table(tab, resize=False)
+        log_timers(timers, time.perf_counter() - t0, params.profile)
     logger.info("Reintegration completed")
 
     logger.info("Converting grid to sparse table...")
