@@ -37,9 +37,11 @@ class Parameters:
     compression: str = field(default="blosc-lz4", choices=["blosc-lz4", "blosc-zstd", "gzip"])
     """datastore compression: blosc-lz4 (default; fast to read and write), blosc-zstd (~20% smaller, slower to
     write), gzip (gzip-1 + shuffle, as mdx2 <= 1.0.5). Blosc needs the hdf5plugin filters wherever the data is read."""
-    nthreads: int = 1
-    """threads per process: decoding frames (NXmx: bitshuffle-LZ4 chunks decompressed outside HDF5) and compressing +
-    writing datastore chunks (Blosc codecs). Memory grows with processes (one batch buffer each), not with threads."""
+    nthreads: int = 4
+    """threads per process: decoding frames (Eiger NXmx: bitshuffle-LZ4 chunks decompressed outside HDF5; miniCBF:
+    byte-offset decoded outside dxtbx) and compressing + writing datastore chunks (Blosc codecs). Memory grows with
+    processes (--nproc: one batch buffer each), not with threads; 4 threads per process was fastest or close to it
+    for Eiger 16M and Pilatus 6M sweeps on 32 cores (8 processes x 4 threads)."""
     reader: str = field(default="auto", choices=["auto", "dxtbx"])
     """auto: read NXmx (e.g. Eiger) files directly with h5py and apply the dxtbx mask in numpy, ~2.5x faster (the first
     frame is checked against dxtbx; if it differs, dxtbx is used); other formats are read with dxtbx.
