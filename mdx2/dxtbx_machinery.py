@@ -579,18 +579,31 @@ class NXmxFrameReader(DirectFrameReader):
             return None, "multi-panel detector"
         panel = detector[0]
         nx, ny = panel.get_image_size()
+        indices = list(iset.indices())
+        needed = max(indices) + 1  # frames of the series that the image set reaches
 
         def layout(f):
+            """The data_NNNNNN links up to the one holding the image set's last frame, in order. Later links are not
+            opened: their data files may be absent (e.g. only the frames of an image_range were kept), as dxtbx
+            allows."""
             if "entry/data" not in f:
                 return "no entry/data group"
             links = sorted(k for k in f["entry/data"] if re.fullmatch(r"data_\d{6}", k))
             if not links:
                 return "no data_NNNNNN datasets"
-            shapes = []
+            shapes, total = [], 0
             for k in links:
-                d = f["entry/data"][k]
+                try:
+                    d = f["entry/data"][k]
+                except KeyError as e:
+                    if "SWMR" in str(e):
+                        raise  # _open_hdf5 retries with the other SWMR flag
+                    return f"{k}: {e}"  # broken external link (data file missing or unreadable)
                 shapes.append((k, d.shape, d.dtype, is_bitshuffle_lz4_frames(d, (ny, nx))))
-            return links, shapes
+                total += d.shape[0] if len(d.shape) == 3 else 0
+                if total >= needed:
+                    break
+            return [s[0] for s in shapes], shapes
 
         _, found = _open_hdf5(paths[0], layout)
         if isinstance(found, str):
@@ -613,8 +626,7 @@ class NXmxFrameReader(DirectFrameReader):
         top = 2**31 if dtype.itemsize >= 4 else 2 ** (8 * dtype.itemsize)
         if lo < 0 or hi >= top - 2:
             return None, f"trusted range {(lo, hi)} overlaps dxtbx's special values"
-        indices = list(iset.indices())
-        if max(indices) >= sum(counts):
+        if needed > sum(counts):
             return None, "image indices beyond the data files"
         static = _static_mask(iset, fmt, paths[0])
         return NXmxFrameReader(paths[0], links, counts, indices, (ny, nx), (lo, hi), static, direct), None
