@@ -130,3 +130,24 @@ def bin_chunk_kernel(
                 s_counts[v] += cval
                 s_sec[v] += seconds[i]
     return pixels, s_phi, s_iy, s_ix, s_counts, s_sec
+
+
+@nb.njit(cache=True, nogil=True)
+def threshold_indices_kernel(data, threshold, maskval):
+    """Flat (C-order) indices of the pixels of a C-contiguous chunk with value != maskval and value > threshold, as
+    int64: the same pixels, in the same order, as np.argwhere(np.ma.masked_equal(data, maskval) > threshold).
+    Two passes: count, then fill."""
+    flat = data.ravel()
+    n = 0
+    for i in range(flat.size):
+        v = flat[i]
+        if v != maskval and v > threshold:
+            n += 1
+    out = np.empty(n, dtype=np.int64)
+    j = 0
+    for i in range(flat.size):
+        v = flat[i]
+        if v != maskval and v > threshold:
+            out[j] = i
+            j += 1
+    return out

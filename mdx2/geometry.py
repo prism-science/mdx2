@@ -145,8 +145,10 @@ class MillerIndex(GridData):
         return MillerIndex(*new_axes, *hkl)
 
     def interpolate(self, phi, iy, ix, **kwargs):
-        hkl = GridData.interpolate(self, phi, iy, ix, **kwargs)
-        return hkl[..., 0], hkl[..., 1], hkl[..., 2]
+        # each component directly: the data property stacks h, k, l into a new array on every access, and
+        # GridData.interpolate reads it several times (Eiger 16M grid: ~10 GB of copies for 3.2 GB of indices).
+        # Same interp3 on the same values, so the result is identical.
+        return tuple(interp3(self.phi, self.iy, self.ix, a, phi, iy, ix, **kwargs) for a in (self.h, self.k, self.l))
 
     @staticmethod
     def from_expt(exptfile, sample_spacing=[1, 10, 10]):
