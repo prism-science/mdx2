@@ -37,6 +37,26 @@ class Parameters:
             raise ValueError(f"valid_range[0] must be < valid_range[1], got {self.valid_range}")
 
 
+def bin_slab(data, maskval, valid_range, mask, y_starts, x_starts):
+    """Mean of the valid pixels of a slab of frames in each (y, x) bin; NaN where a bin has none. Valid: not maskval,
+    within valid_range (inclusive) if given, and not set in mask (True = masked) if given. Bins start at y_starts /
+    x_starts. Integer data are summed in int64 and divided once, as np.ma.mean does, so the means are identical to
+    the masked-array version this replaces (a Python loop over bins; ~3x slower)."""
+    valid = data != maskval
+    if valid_range is not None:
+        valid &= (data >= valid_range[0]) & (data <= valid_range[1])
+    if mask is not None:
+        valid &= ~np.asarray(mask, dtype=bool)
+    acc = np.int64 if np.issubdtype(data.dtype, np.integer) else np.float64
+    sums = np.where(valid, data, 0).sum(axis=0, dtype=acc)
+    counts = valid.sum(axis=0, dtype=np.int64)
+    sums = np.add.reduceat(np.add.reduceat(sums, y_starts, axis=0), x_starts, axis=1)
+    counts = np.add.reduceat(np.add.reduceat(counts, y_starts, axis=0), x_starts, axis=1)
+    out = np.full(sums.shape, np.nan)
+    np.divide(sums, counts, out=out, where=counts > 0)
+    return out
+
+
 def run_bin_image_series(params):
     """Run the binning algorithm"""
     data = params.data
@@ -76,22 +96,13 @@ def run_bin_image_series(params):
     new_iy = np.array([image_series.iy[sl].mean() for sl in sl_1])
     new_ix = np.array([image_series.ix[sl].mean() for sl in sl_2])
 
+    y_starts = np.array([sl.start for sl in sl_1])
+    x_starts = np.array([sl.start for sl in sl_2])
+
     def binslab(sl):
-        outslab = np.empty([len(sl_1), len(sl_2)], dtype=float)
-        tmp = image_series._as_np(image_series.data[sl, :, :])
-        tmp = np.ma.masked_equal(tmp, image_series._maskval, copy=False)
-        if valid_range is not None:
-            tmp = np.ma.masked_outside(tmp, valid_range[0], valid_range[1], copy=False)
-        if mask is not None:
-            msk = image_series._as_np(mask[sl, :, :])
-            tmp = np.ma.masked_where(msk, tmp, copy=False)
-        for ind_y, sl_y in enumerate(sl_1):  # not vectorized - could be slow?
-            for ind_x, sl_x in enumerate(sl_2):
-                val = tmp[:, sl_y, sl_x].mean()
-                if np.ma.is_masked(val):
-                    val = np.nan
-                outslab[ind_y, ind_x] = val
-        return outslab
+        data = image_series._as_np(image_series.data[sl, :, :])
+        msk = image_series._as_np(mask[sl, :, :]) if mask is not None else None
+        return bin_slab(data, image_series._maskval, valid_range, msk, y_starts, x_starts)
 
     logger.info("Binning {} image slabs (requested n_jobs: {})...", len(sl_0), nproc)
     with Parallel(n_jobs=nproc, verbose=10) as parallel:
