@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 from nexusformat.nexus import NXfield
 
+from mdx2.command_line.bin_image_series import Parameters as BinParams
+from mdx2.command_line.bin_image_series import run_bin_image_series
 from mdx2.command_line.integrate import Parameters as IntParams
 from mdx2.command_line.integrate import run_integrate
 from mdx2.command_line.mask_peaks import Parameters as MaskParams
@@ -205,3 +207,10 @@ def test_ellipsoid_expression_matches_quadform():
     got = peak_model_mask(h.reshape(100, 200), k.reshape(100, 200), l.reshape(100, 200), symmetry(), peak, 2.5)
     assert ref.sum() > 100
     np.testing.assert_array_equal(got.ravel(), ref)
+
+
+def test_bin_image_series_rejects_dynamic_mask(sweep):
+    tmp_path, geom, dat, pk = sweep
+    _, fd = make_masks(tmp_path, geom, dat, pk)
+    with pytest.raises(ValueError, match="dynamic peak mask"):
+        run_bin_image_series(BinParams(data=dat, bins=(2, 10, 10), mask=fd, outfile=str(tmp_path / "b.nxs")))
