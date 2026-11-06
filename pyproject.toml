@@ -23,6 +23,8 @@ dependencies = [
     "scipy",
     "dxtbx", 
     "hdf5plugin",
+    "bitshuffle",
+    "numcodecs",
     "nexusformat",
     "joblib",
     "numexpr",
