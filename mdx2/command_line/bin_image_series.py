@@ -54,6 +54,11 @@ def run_bin_image_series(params):
         logger.info("Loading mask...")
         # Use nxload directly instead of loadobj because loadobj fails for very large arrays
         nxs = nxload(maskfile)
+        if nxs.entry.mask.attrs.get("mdx2_class") == "PeakMask":
+            raise ValueError(
+                f"{maskfile} is a dynamic peak mask (peak model + pixel list), which bin_image_series does not support "
+                "(it needs the Miller-index grid); write a static mask with mdx2.mask_peaks --static"
+            )
         mask = nxs.entry.mask.signal  # nxfield
     else:
         mask = None
