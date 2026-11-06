@@ -10,6 +10,7 @@ import h5py
 import hdf5plugin
 import numpy as np
 import pytest
+from dxtbx.format.FormatNXmx import FormatNXmx
 from nexusformat.nexus import NXfield
 
 import mdx2
@@ -185,8 +186,6 @@ class _FakeImageSet:
     """The parts of a dxtbx image set that NXmxFrameReader.from_imageset reads."""
 
     def __init__(self, master, indices, ny, nx):
-        from dxtbx.format.FormatNXmx import FormatNXmx
-
         self.fmt = type("FakeNXmx", (FormatNXmx,), {})
         self.master, self._indices, self.panel = master, list(indices), _FakePanel(ny, nx)
 
@@ -210,9 +209,7 @@ class _FakeImageSet:
 def test_nxmx_reader_data_files_beyond_image_set_absent(tmp_path, monkeypatch, indices, links_used):
     """Only the data files the image set reaches are opened: later ones may be absent (an image_range of a longer
     series, with only those frames' files kept), as dxtbx allows."""
-    import mdx2.dxtbx_machinery as dm
-
-    monkeypatch.setattr(dm, "_static_mask", lambda iset, fmt, path: None)
+    monkeypatch.setattr("mdx2.dxtbx_machinery._static_mask", lambda iset, fmt, path: None)
     master, data = write_nxmx_like(tmp_path, frames_per_file=(4, 3, 3))
     (tmp_path / "data_000003.h5").unlink()
     if links_used == 1:
