@@ -11,7 +11,7 @@ from nexusformat.nexus import NXdata, NXfield, NXgroup, NXreflections, NXvirtual
 
 from mdx2 import profiling
 from mdx2.dxtbx_machinery import Experiment
-from mdx2.io import nxload, saveobj
+from mdx2.io import array_field, nxload, saveobj
 
 
 class Peaks:
@@ -58,9 +58,9 @@ class Peaks:
     def to_nexus(self):
         return NXreflections(
             name="peaks",
-            observed_phi=self.phi,
-            observed_px_x=self.ix,
-            observed_px_y=self.iy,
+            observed_phi=array_field(self.phi, "observed_phi", column=True),
+            observed_px_x=array_field(self.ix, "observed_px_x", column=True),
+            observed_px_y=array_field(self.iy, "observed_px_y", column=True),
         )
 
     @staticmethod
@@ -247,7 +247,10 @@ class HKLTable:
         return HKLTable(h, k, l, **data)
 
     def to_nexus(self):
-        return NXgroup(name="hkl_table", **self.__dict__)
+        fields = {
+            k: array_field(v, k, column=True) if isinstance(v, np.ndarray) else v for k, v in self.__dict__.items()
+        }
+        return NXgroup(name="hkl_table", **fields)
 
     @staticmethod
     def from_nexus(nxgroup):
