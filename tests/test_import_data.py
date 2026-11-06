@@ -13,10 +13,16 @@ import pytest
 from nexusformat.nexus import NXfield
 
 import mdx2
-from mdx2._import_kernels import MASKED16, OVERFLOW16, pack_frame
+from mdx2._import_kernels import MASKED16, OVERFLOW16, decode_byte_offset, pack_frame
 from mdx2.command_line.import_data import direct_write_codec, import_batch, write_chunks
 from mdx2.data import DATASTORE_COMPRESSION, ImageSeries
-from mdx2.dxtbx_machinery import NXmxFrameReader, is_bitshuffle_lz4_frames
+from mdx2.dxtbx_machinery import (
+    CBF_MARKER,
+    CBFFrameReader,
+    NXmxFrameReader,
+    cbf_binary_section,
+    is_bitshuffle_lz4_frames,
+)
 
 
 def frames(rng, n=5, ny=37, nx=53):
@@ -195,3 +201,101 @@ def test_bitshuffle_loaded_before_cctbx_openmp_stubs():
     y = bitshuffle.decompress_lz4(bitshuffle.compress_lz4(x), x.shape, x.dtype)
     np.testing.assert_array_equal(x, y)
     assert "omptbx_ext" in sys.modules
+
+
+# ---- miniCBF ---------------------------------------------------------------------------------------------------------
+
+
+def encode_byte_offset(values):
+    """CBF x-CBF_BYTE_OFFSET encoding (reference implementation for the tests)."""
+    out = bytearray()
+    prev = 0
+    for v in np.asarray(values, dtype=np.int64).ravel():
+        d = int(v) - prev
+        prev = int(v)
+        if -127 <= d <= 127:
+            out += int(d).to_bytes(1, "little", signed=True)
+        elif -32767 <= d <= 32767:
+            out += b"\x80" + int(d).to_bytes(2, "little", signed=True)
+        elif -(2**31) + 1 <= d <= 2**31 - 1:
+            out += b"\x80\x00\x80" + int(d).to_bytes(4, "little", signed=True)
+        else:
+            out += b"\x80\x00\x80\x00\x00\x00\x80" + int(d).to_bytes(8, "little", signed=True)
+    return bytes(out)
+
+
+def write_minicbf(path, frame, element_type="signed 32-bit integer", conversions="x-CBF_BYTE_OFFSET"):
+    ny, nx = frame.shape
+    data = encode_byte_offset(frame)
+    head = (
+        "###CBF: VERSION 1.5\r\n# Detector: PILATUS 6M, S/N 60-0000 (test)\r\n\r\n"
+        "data_frame\r\n\r\n_array_data.data\r\n"
+        ";\r\n--CIF-BINARY-FORMAT-SECTION--\r\nContent-Type: application/octet-stream;\r\n"
+        f'     conversions="{conversions}"\r\nContent-Transfer-Encoding: BINARY\r\nX-Binary-Size: {len(data)}\r\n'
+        f'X-Binary-ID: 1\r\nX-Binary-Element-Type: "{element_type}"\r\nX-Binary-Element-Byte-Order: LITTLE_ENDIAN\r\n'
+        f"X-Binary-Number-of-Elements: {ny * nx}\r\nX-Binary-Size-Fastest-Dimension: {nx}\r\n"
+        f"X-Binary-Size-Second-Dimension: {ny}\r\nX-Binary-Size-Padding: 4095\r\n\r\n"
+    )
+    with open(path, "wb") as f:
+        f.write(
+            head.encode("latin-1")
+            + CBF_MARKER
+            + data
+            + b"\x00" * 4095
+            + b"\r\n--CIF-BINARY-FORMAT-SECTION----\r\n;\r\n"
+        )
+
+
+def cbf_frames(n=5, ny=17, nx=23):
+    rng = np.random.default_rng(5)
+    f = rng.poisson(5.0, (n, ny, nx)).astype(np.int64)
+    f[:, :, 7] = -1  # gap column
+    f[1, 2, 3] = -2  # bad pixel
+    f[2, 0, :6] = [200, -200, 40000, -40000, 2**31 - 1, -(2**31)]  # 16- and 32-bit escapes
+    f[3, 5, 5] = 1_000_000  # above the trusted range
+    return f.astype(np.int32)
+
+
+def test_decode_byte_offset_escapes():
+    v = np.array([0, 127, -128, 127, 32767, -32768, 32767, 2**31 - 1, -(2**31), 5], dtype=np.int64)
+    out = np.empty(v.size, dtype=np.int32)
+    data = np.frombuffer(encode_byte_offset(v), dtype=np.uint8)
+    assert decode_byte_offset(data, out) == data.size
+    np.testing.assert_array_equal(out, v)
+    assert decode_byte_offset(data[:-1], out) == -1  # truncated
+
+
+def test_cbf_reader(tmp_path):
+    data = cbf_frames()
+    paths = []
+    for i, frame in enumerate(data):
+        paths.append(str(tmp_path / f"frame_{i:04d}.cbf"))
+        write_minicbf(paths[-1], frame)
+    static = np.ones(data.shape[1:], dtype=bool)
+    static[10, :] = False  # e.g. a module-gap row from the format's static mask
+    lo, hi = 0.0, 500000.0
+    r = CBFFrameReader(paths, data.shape[1:], (lo, hi), static)
+    expected = np.where((data >= lo) & (data <= hi) & static, data, -1)
+    for i in range(len(paths)):
+        np.testing.assert_array_equal(r.read_frame(i), expected[i])
+    r.open()
+    buf = np.empty(data.shape, dtype=np.uint16)
+    with ThreadPoolExecutor(3) as pool:
+        overflows = list(pool.map(lambda i: r.pack(i, buf[i]), range(len(paths))))
+    assert all(ov is None for ov, _ in overflows)  # valid values are <= 40000 here
+    np.testing.assert_array_equal(np.where(buf == MASKED16, -1, buf.astype(np.int32)), expected)
+    assert {"read", "decompress", "pack"} <= set(overflows[0][1])
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [({"element_type": "unsigned 16-bit integer"}, "element type"), ({"conversions": "x-CBF_PACKED"}, "BYTE_OFFSET")],
+)
+def test_cbf_header_checks(tmp_path, kwargs, message):
+    frame = cbf_frames()[0]
+    write_minicbf(tmp_path / "f.cbf", frame, **kwargs)
+    with pytest.raises(ValueError, match=message):
+        cbf_binary_section((tmp_path / "f.cbf").read_bytes(), frame.shape)
+    write_minicbf(tmp_path / "g.cbf", frame)
+    with pytest.raises(ValueError, match="panel"):
+        cbf_binary_section((tmp_path / "g.cbf").read_bytes(), (frame.shape[0] + 1, frame.shape[1]))

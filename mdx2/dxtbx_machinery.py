@@ -8,6 +8,7 @@ import hdf5plugin  # noqa: F401  (HDF5 filters for detector data, e.g. bitshuffl
 import numpy as np
 from cctbx.eltbx import attenuation_coefficient
 from dxtbx import flumpy
+from dxtbx.format.FormatCBFMini import FormatCBFMini
 from dxtbx.format.FormatNXmx import FormatNXmx
 from dxtbx.format.FormatPilatusHelpers import sensor_active_areas
 from dxtbx.model.experiment_list import ExperimentList
@@ -15,7 +16,7 @@ from scitbx import matrix
 from threadpoolctl import threadpool_limits
 
 import mdx2
-from mdx2._import_kernels import pack_frame, pack_raw
+from mdx2._import_kernels import decode_byte_offset, pack_frame, pack_raw
 
 if mdx2.BITSHUFFLE_SAFE:  # loaded by mdx2/__init__.py before cctbx (see there); else NXmx frames are read with h5py
     import bitshuffle
@@ -387,8 +388,15 @@ class ImageSet:
         return overflow, {"read": t1 - t0, "pack": time.perf_counter() - t1}
 
     def direct_reader(self):
-        """A NXmxFrameReader for this image set, or (None, reason) if it does not apply."""
-        return NXmxFrameReader.from_imageset(self._iset)
+        """A frame reader that bypasses dxtbx (NXmxFrameReader or CBFFrameReader) for this image set, or
+        (None, reason) if none applies."""
+        reader, why_nxmx = NXmxFrameReader.from_imageset(self._iset)
+        if reader is not None:
+            return reader, None
+        reader, why_cbf = CBFFrameReader.from_imageset(self._iset)
+        if reader is not None:
+            return reader, None
+        return None, f"{why_nxmx}; {why_cbf}"
 
 
 def _open_hdf5(path, work, keep_open=False):
@@ -425,7 +433,91 @@ def is_bitshuffle_lz4_frames(dataset, frame_shape):
     return code == BSHUF_FILTER and len(values) >= 5 and values[4] == BSHUF_LZ4
 
 
-class NXmxFrameReader:
+def _static_mask(iset, fmt, path):
+    """The image set's static mask (bool, True = valid) as dxtbx applies it: the format's static mask (e.g. Pilatus
+    module gaps) and the experiment's external lookup mask; None if neither."""
+    masks = []
+    fmask = fmt.get_instance(path).get_static_mask()
+    if fmask is not None:
+        masks.append(fmask[0].as_numpy_array())
+    ext = iset.external_lookup.mask
+    if ext.data is not None and not ext.data.empty():
+        masks.append(ext.data.tile(0).data().as_numpy_array())
+    return np.logical_and.reduce(masks) if masks else None
+
+
+class DirectFrameReader:
+    """Base of the frame readers that bypass dxtbx (NXmxFrameReader, CBFFrameReader).
+
+    Subclasses provide read_raw(ind, times) -> the frame as stored, and set lo / hi (integer bounds of the trusted
+    range in the frame's dtype) when opened. The mask is dxtbx's for these formats: static mask (format + external
+    lookup) and trusted range, inclusive at both ends (dxtbx.model.Panel.get_trusted_range_mask). import_data checks the
+    first frame against dxtbx (check_against) in the main process. Picklable: files are opened in each process."""
+
+    concurrent = True  # frame source protocol (see import_data): thread-safe after open(); decoding releases the GIL
+
+    def __init__(self, frame_shape, trusted_range, static_mask):
+        self.frame_shape = tuple(frame_shape)
+        self.trusted_range = trusted_range
+        self.static_mask = static_mask  # bool (ny, nx), True = valid; or None
+        self._local = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_local"] = None
+        return state
+
+    def describe(self):
+        return type(self).__name__
+
+    def open(self):
+        """Prepare for reading (once per process, before any concurrent reads)."""
+        if self._local is None:
+            self._local = threading.local()  # per-thread buffers
+
+    def close(self):
+        pass
+
+    def _set_bounds(self, dtype):
+        info = np.iinfo(dtype)
+        lo, hi = self.trusted_range
+        # integer bounds (dxtbx compares in double precision; the same for integer values)
+        self.lo = dtype.type(max(math.ceil(lo), info.min))
+        self.hi = dtype.type(min(math.floor(hi), info.max))
+
+    def pack(self, ind, buf):
+        """Frame source protocol: frame ind into buf (uint16 codes, mdx2._import_kernels). Returns (overflow pixels
+        (y, x, values) or None, step times). Thread-safe after open()."""
+        times = {}
+        raw = self.read_raw(ind, times)
+        t0 = time.perf_counter()
+        overflow = pack_raw(raw, self.lo, self.hi, self.static_mask, buf)
+        times["pack"] = time.perf_counter() - t0
+        return overflow, times
+
+    def read_frame(self, ind, out=None):
+        """Frame ind of the image set as int32 with masked pixels -1 (as ImageSet.read_frame)."""
+        v = self.read_raw(ind)
+        invalid = (v < self.lo) | (v > self.hi)
+        if self.static_mask is not None:
+            invalid |= ~self.static_mask
+        if out is None:
+            out = np.empty(self.frame_shape, dtype=np.int32)
+        np.copyto(out, v, casting="unsafe")  # valid values are within the trusted range, so they fit int32
+        np.putmask(out, invalid, -1)
+        return out
+
+    def check_against(self, imageset):
+        """Compare the first frame with ImageSet.read_frame (dxtbx). Returns None if identical, else a description."""
+        self.open()
+        ref = imageset.read_frame(0)
+        mine = self.read_frame(0)
+        if not np.array_equal(ref, mine):
+            return f"frame 0: {int(np.sum(ref != mine))} pixels differ"
+        return None
+
+
+class NXmxFrameReader(DirectFrameReader):
     """Reads frames of an NXmx (e.g. Eiger) image set with h5py and applies the dxtbx mask in numpy.
 
     Same result as ImageSet.read_frame (int32, masked pixels -1) for formats where dxtbx's mask is the static mask
@@ -435,30 +527,33 @@ class NXmxFrameReader:
     h5py in the workers: import_data checks it against dxtbx once, in the main process (check_against).
     """
 
-    concurrent = True  # frame source protocol (see import_data): thread-safe; decompression releases the GIL if direct
-
     def __init__(self, master, links, counts, indices, frame_shape, trusted_range, static_mask, direct=False):
+        super().__init__(frame_shape, trusted_range, static_mask)
         self.master = master
         self.links = links  # entry/data/data_NNNNNN paths in the master file, in frame order
         self.starts = np.concatenate([[0], np.cumsum(counts)])
         self.indices = np.asarray(indices)  # image-set index -> frame index in the data files
-        self.frame_shape = frame_shape
-        self.trusted_range = trusted_range
-        self.static_mask = static_mask  # bool (ny, nx), True = valid; or None
         # direct: every data-file chunk is one frame compressed with bitshuffle-LZ4; read raw chunks
         # (read_direct_chunk) and decompress them with the bitshuffle package, outside HDF5 and its lock
         self.direct = bool(direct) and bitshuffle is not None
         self._datasets = None
         self._file = None
-        self._local = None
 
     def __getstate__(self):
-        state = self.__dict__.copy()
-        state["_datasets"] = state["_file"] = state["_local"] = None
+        state = super().__getstate__()
+        state["_datasets"] = state["_file"] = None
         return state
+
+    def describe(self):
+        if self.direct:
+            return "NXmx data files: raw bitshuffle-LZ4 chunks, decompressed outside HDF5"
+        if not mdx2.BITSHUFFLE_SAFE:
+            return "NXmx data files with h5py (bitshuffle not used: cctbx was loaded before mdx2, OpenMP stubs)"
+        return "NXmx data files with h5py"
 
     def open(self):
         """Open the files (once per process, before any concurrent reads)."""
+        super().open()
         if self._datasets is None:
             self._open()
 
@@ -520,31 +615,17 @@ class NXmxFrameReader:
         indices = list(iset.indices())
         if max(indices) >= sum(counts):
             return None, "image indices beyond the data files"
-        static = None
-        masks = []
-        instance = fmt.get_instance(paths[0])
-        fmask = instance.get_static_mask()
-        if fmask is not None:
-            masks.append(fmask[0].as_numpy_array())
-        ext = iset.external_lookup.mask
-        if ext.data is not None and not ext.data.empty():
-            masks.append(ext.data.tile(0).data().as_numpy_array())
-        if masks:
-            static = np.logical_and.reduce(masks)
+        static = _static_mask(iset, fmt, paths[0])
         return NXmxFrameReader(paths[0], links, counts, indices, (ny, nx), (lo, hi), static, direct), None
 
     def _open(self):
         self._file, self._datasets = _open_hdf5(
             self.master, lambda f: [f["entry/data"][k] for k in self.links], keep_open=True
         )
-        dtype = self._datasets[0].dtype
-        self.dtype = dtype
-        info = np.iinfo(dtype)
-        lo, hi = self.trusted_range
-        # integer bounds (dxtbx compares in double precision; the same for integer values)
-        self.lo = dtype.type(max(math.ceil(lo), info.min))
-        self.hi = dtype.type(min(math.floor(hi), info.max))
-        self._local = threading.local()  # per-thread frame buffer (h5py reads)
+        self.dtype = self._datasets[0].dtype
+        self._set_bounds(self.dtype)
+        if self._local is None:
+            self._local = threading.local()
 
     def _locate(self, ind):
         g = int(self.indices[ind])
@@ -588,35 +669,93 @@ class NXmxFrameReader:
             times["read"] = times.get("read", 0.0) + time.perf_counter() - t0
         return buf
 
-    def pack(self, ind, buf):
-        """Frame source protocol: frame ind into buf (uint16 codes, mdx2._import_kernels). Returns (overflow pixels
-        (y, x, values) or None, step times). Thread-safe after open()."""
-        times = {}
-        raw = self.read_raw(ind, times)
+
+CBF_MARKER = b"\x0c\x1a\x04\xd5"  # start of the binary section of a CBF file
+
+
+class CBFFrameReader(DirectFrameReader):
+    """Reads miniCBF frames (Pilatus, and Eiger written as CBF): one uncompressed .cbf file per frame, binary data
+    x-CBF_BYTE_OFFSET, signed 32-bit, little-endian. Decoded with a compiled byte-offset decoder that releases the GIL
+    (dxtbx's holds it). Same mask as dxtbx (see DirectFrameReader); CBF's -1 (gap) and -2 (bad pixel) values are below
+    the trusted range."""
+
+    def __init__(self, paths, frame_shape, trusted_range, static_mask):
+        super().__init__(frame_shape, trusted_range, static_mask)
+        self.paths = list(paths)  # one file per image-set index
+        self._set_bounds(np.dtype(np.int32))
+
+    def describe(self):
+        return "CBF files: byte-offset decoded outside dxtbx"
+
+    @staticmethod
+    def from_imageset(iset):
+        """(reader, None) if the CBF reader applies to this dxtbx image set, else (None, reason)."""
+        fmt = iset.get_format_class()
+        if fmt is None or not issubclass(fmt, FormatCBFMini):
+            return None, f"format {getattr(fmt, '__name__', fmt)} is not miniCBF"
+        if iset.has_dynamic_mask():
+            return None, "dynamic mask"
+        detector = iset.get_detector()
+        if len(detector) != 1:
+            return None, "multi-panel detector"
+        nx, ny = detector[0].get_image_size()
+        paths = [iset.get_path(i) for i in range(len(iset))]
+        if len(set(paths)) != len(paths) or not all(p.endswith(".cbf") for p in paths):
+            return None, "not one uncompressed .cbf file per frame"
+        try:
+            with open(paths[0], "rb") as f:
+                cbf_binary_section(f.read(), (ny, nx))
+        except ValueError as e:
+            return None, str(e)
+        trusted = detector[0].get_trusted_range()
+        return CBFFrameReader(paths, (ny, nx), trusted, _static_mask(iset, fmt, paths[0])), None
+
+    def read_raw(self, ind, times=None):
+        """Frame ind as stored (int32; no mask applied). Thread-safe after open(); the returned array is reused by the
+        next call in the same thread. times (dict): adds "read" (file) and "decompress" (byte-offset) seconds."""
+        if self._local is None:
+            self.open()
         t0 = time.perf_counter()
-        overflow = pack_raw(raw, self.lo, self.hi, self.static_mask, buf)
-        times["pack"] = time.perf_counter() - t0
-        return overflow, times
+        with open(self.paths[ind], "rb") as f:
+            raw = f.read()
+        t1 = time.perf_counter()
+        data = cbf_binary_section(raw, self.frame_shape)
+        buf = getattr(self._local, "buf", None)
+        if buf is None:
+            buf = self._local.buf = np.empty(self.frame_shape, dtype=np.int32)
+        status = decode_byte_offset(data, buf.reshape(-1))
+        if status < 0:
+            raise ValueError(f"{self.paths[ind]}: " + ("byte-offset data ended early" if status == -1 else "overflow"))
+        if times is not None:
+            times["read"] = times.get("read", 0.0) + t1 - t0
+            times["decompress"] = times.get("decompress", 0.0) + time.perf_counter() - t1
+        return buf
 
-    def read_frame(self, ind, out=None):
-        """Frame ind of the image set as int32 with masked pixels -1 (as ImageSet.read_frame)."""
-        v = self.read_raw(ind)
-        invalid = (v < self.lo) | (v > self.hi)
-        if self.static_mask is not None:
-            invalid |= ~self.static_mask
-        if out is None:
-            out = np.empty(self.frame_shape, dtype=np.int32)
-        np.copyto(out, v, casting="unsafe")  # valid values are within the trusted range, so they fit int32
-        np.putmask(out, invalid, -1)
-        return out
 
-    def check_against(self, imageset):
-        """Compare the first frame with ImageSet.read_frame (dxtbx). Returns None if identical, else a description."""
-        ref = imageset.read_frame(0)
-        mine = self.read_frame(0)
-        if not np.array_equal(ref, mine):
-            return f"frame 0: {int(np.sum(ref != mine))} pixels differ"
-        return None
+def cbf_binary_section(raw, frame_shape):
+    """The binary data of a miniCBF file (uint8 array), after checking its MIME header: byte-offset compression, signed
+    32-bit little-endian elements, frame_shape (ny, nx). Raises ValueError otherwise."""
+    p = raw.find(CBF_MARKER)
+    if p < 0:
+        raise ValueError("no CBF binary section")
+    head = raw[max(0, p - 4096) : p].decode("latin-1")
+    fields = dict(re.findall(r"^\s*(X-Binary-[\w-]+|Content-Type|Content-Transfer-Encoding):\s*(.+?)\s*$", head, re.M))
+    if "x-CBF_BYTE_OFFSET" not in fields.get("Content-Type", "") and "x-CBF_BYTE_OFFSET" not in head:
+        raise ValueError("CBF data is not x-CBF_BYTE_OFFSET")
+    if "signed 32-bit integer" not in fields.get("X-Binary-Element-Type", ""):
+        raise ValueError(f"CBF element type {fields.get('X-Binary-Element-Type')!r}")
+    if "LITTLE_ENDIAN" not in fields.get("X-Binary-Element-Byte-Order", "LITTLE_ENDIAN"):
+        raise ValueError("CBF data is not little-endian")
+    try:
+        size = int(fields["X-Binary-Size"])
+        shape = (int(fields["X-Binary-Size-Second-Dimension"]), int(fields["X-Binary-Size-Fastest-Dimension"]))
+    except (KeyError, ValueError):
+        raise ValueError("CBF binary header without size / dimensions") from None
+    if shape != tuple(frame_shape):
+        raise ValueError(f"CBF frame {shape}, panel {tuple(frame_shape)}")
+    if p + 4 + size > len(raw):
+        raise ValueError("CBF binary section truncated")
+    return np.frombuffer(raw, dtype=np.uint8, count=size, offset=p + 4)
 
 
 def calc_rotation_matrix_at_phi(goniometer, phi_vals_deg):

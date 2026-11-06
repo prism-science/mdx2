@@ -14,7 +14,6 @@ from loguru import logger
 from numcodecs import Blosc, blosc
 from simple_parsing import field
 
-import mdx2
 from mdx2._import_kernels import OVERFLOW16, unpack_kernel
 from mdx2.command_line import log_parallel_backend, make_argument_parser, with_logging, with_parsing
 from mdx2.data import ImageSeries
@@ -219,17 +218,9 @@ def run_import_data(params):
             mismatch = reader.check_against(iset)
             reader.close()
             if mismatch is None:
-                if reader.direct:
-                    how = "raw bitshuffle-LZ4 chunks, decompressed outside HDF5"
-                elif not mdx2.BITSHUFFLE_SAFE:
-                    how = "h5py; bitshuffle not used: cctbx was loaded before mdx2 (OpenMP stubs)"
-                else:
-                    how = "h5py"
-                logger.info(
-                    "Reading frames directly from the NXmx data files ({}; first frame identical to dxtbx)", how
-                )
+                logger.info("Reading frames from the {} (first frame identical to dxtbx)", reader.describe())
             else:
-                logger.warning("Direct NXmx reader differs from dxtbx ({}); reading frames with dxtbx", mismatch)
+                logger.warning("{} differs from dxtbx ({}); reading frames with dxtbx", type(reader).__name__, mismatch)
                 reader = None
     else:
         logger.info("Reading frames with dxtbx")
