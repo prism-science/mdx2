@@ -759,7 +759,9 @@ class ImageSeries:
             # some kind of bug that I don't have time to track down right now.
             saveobj(self, filename, name=name, **kwargs)
 
-            with h5py.File(filename, "r+", libver="latest") as f:
+            # lower bound 1.10 (the first with virtual datasets), not "latest": with HDF5 >= 2.0, a 2.0 lower bound
+            # encodes the VDS mappings in a format (global heap block version 1) that HDF5 1.x cannot read
+            with h5py.File(filename, "r+", libver=("v110", "latest")) as f:
                 del f[data_path]
                 f.create_virtual_dataset(data_path, layout, fillvalue=self._maskval)
 
