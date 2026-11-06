@@ -303,8 +303,9 @@ class Experiment:
         # array of fractionalization matrix
         invUB = np.linalg.inv(UB)
 
-        hkl = np.tensordot(invUB, s, axes=1)
-        h, k, l = hkl[:, 0, :, :], hkl[:, 1, :, :], hkl[:, 2, :, :]
+        # one tensordot per component: contiguous h, k, l (strided views of one (phi, 3, iy, ix) array cost an extra
+        # contiguous copy per component when written); identical values, same time
+        h, k, l = (np.tensordot(invUB[:, i, :], s, axes=1) for i in range(3))  # noqa: E741
 
         return h, k, l
 
