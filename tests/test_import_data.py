@@ -10,6 +10,7 @@ import h5py
 import hdf5plugin
 import numpy as np
 import pytest
+from dxtbx.format.FormatNXmx import FormatNXmx
 from nexusformat.nexus import NXfield
 
 import mdx2
@@ -168,6 +169,61 @@ def test_nxmx_reader(tmp_path, bitshuffle, held_swmr):
     r.close()
     if held is not None:
         held.close()
+
+
+class _FakePanel:
+    def __init__(self, ny, nx):
+        self.size = (nx, ny)
+
+    def get_image_size(self):
+        return self.size
+
+    def get_trusted_range(self):
+        return (0.0, 65000.0)
+
+
+class _FakeImageSet:
+    """The parts of a dxtbx image set that NXmxFrameReader.from_imageset reads."""
+
+    def __init__(self, master, indices, ny, nx):
+        self.fmt = type("FakeNXmx", (FormatNXmx,), {})
+        self.master, self._indices, self.panel = master, list(indices), _FakePanel(ny, nx)
+
+    def get_format_class(self):
+        return self.fmt
+
+    def paths(self):
+        return [self.master] * len(self._indices)
+
+    def has_dynamic_mask(self):
+        return False
+
+    def get_detector(self):
+        return [self.panel]
+
+    def indices(self):
+        return self._indices
+
+
+@pytest.mark.parametrize("indices, links_used", [(range(4), 1), (range(5), 2), (range(7), 2)])
+def test_nxmx_reader_data_files_beyond_image_set_absent(tmp_path, monkeypatch, indices, links_used):
+    """Only the data files the image set reaches are opened: later ones may be absent (an image_range of a longer
+    series, with only those frames' files kept), as dxtbx allows."""
+    monkeypatch.setattr("mdx2.dxtbx_machinery._static_mask", lambda iset, fmt, path: None)
+    master, data = write_nxmx_like(tmp_path, frames_per_file=(4, 3, 3))
+    (tmp_path / "data_000003.h5").unlink()
+    if links_used == 1:
+        (tmp_path / "data_000002.h5").unlink()
+    r, why = NXmxFrameReader.from_imageset(_FakeImageSet(master, indices, *data.shape[1:]))
+    assert why is None
+    assert len(r.links) == links_used
+    expected = expected_frames(data, 0.0, 65000.0)
+    for ind in range(len(indices)):
+        np.testing.assert_array_equal(r.read_frame(ind), expected[ind])
+    r.close()
+    # a data file the image set needs is missing: no direct reader (import_data falls back to dxtbx), no exception
+    r, why = NXmxFrameReader.from_imageset(_FakeImageSet(master, range(8), *data.shape[1:]))
+    assert r is None and why.startswith("data_00000") and "can't open file" in why
 
 
 @pytest.mark.parametrize("compression", ["blosc-lz4", "blosc-zstd", "gzip"])
