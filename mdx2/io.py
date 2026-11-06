@@ -2,12 +2,40 @@ import importlib
 import warnings
 
 import h5py
-from nexusformat.nexus import NXentry, NXgroup, NXroot, NXvirtualfield
+import hdf5plugin
+import numpy as np
+from nexusformat.nexus import NXentry, NXfield, NXgroup, NXroot, NXvirtualfield
 from nexusformat.nexus import nxload as nexus_nxload
+from nexusformat.nexus.tree import NX_CONFIG
 
 import mdx2
 
 # FUNCTIONS FOR LOADING AND SAVING MDX2 CLASSES TO NEXUS FILES
+
+# Large numeric arrays of mdx2 objects (hkl-table columns, peaks, Miller-index grids, correction maps, masks) are
+# written with Blosc LZ4 + byte shuffle (array_field, used in the objects' to_nexus), not nexusformat's default for
+# fields above its maxsize (gzip level 4 + HDF5 shuffle, ~100 KB chunks, single-threaded). Eiger 16M sweep (pod, one
+# thread): the 53.7 M-row corrected table took 33 s to write and 7.5 s to read with gzip, 1.9 s and 1.4 s with Blosc
+# (11% larger); the 3.2 GB Miller-index grid 63 s / 9.6 s vs 2.4 s / 1.5 s (7% larger). Byte shuffle beat bit shuffle
+# on these float arrays. Reading needs the hdf5plugin filters (imported here). The image datastore has its own
+# setting (mdx2.data.DATASTORE_COMPRESSION).
+ARRAY_COMPRESSION = dict(
+    compression=hdf5plugin.Blosc(cname="lz4", clevel=5, shuffle=hdf5plugin.Blosc.SHUFFLE), shuffle=False
+)
+TABLE_CHUNK_BYTES = 1 << 20  # table columns: ~1 MB chunks (h5py's guess for 1-D data is ~100 KB)
+
+
+def array_field(value, name=None, column=False, **kwargs):
+    """NXfield for a numeric array that may be large. Up to nexusformat's maxsize (10000 elements) a plain field (no
+    compression, as nexusformat); above it ARRAY_COMPRESSION, and for column=True (1-D table columns) chunks of
+    ~TABLE_CHUNK_BYTES; other arrays keep nexusformat's chunking."""
+    value = np.asarray(value)
+    if value.dtype.kind not in "biuf" or value.size <= NX_CONFIG["maxsize"]:
+        return NXfield(value, name=name, **kwargs)
+    opts = dict(ARRAY_COMPRESSION)
+    if column and value.ndim == 1:
+        opts["chunks"] = (max(1, min(value.size, TABLE_CHUNK_BYTES // value.dtype.itemsize)),)
+    return NXfield(value, name=name, **opts, **kwargs)
 
 
 def _patch_virtualfields(g):

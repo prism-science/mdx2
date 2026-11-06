@@ -3,7 +3,7 @@ import numpy as np
 from nexusformat.nexus import NXdata, NXfield, NXgroup, NXsample
 
 from mdx2.dxtbx_machinery import Experiment
-from mdx2.io import loadobj, nxload
+from mdx2.io import array_field, loadobj, nxload
 from mdx2.utils import interp2, interp3, interp_g2g_trilinear
 
 
@@ -106,7 +106,7 @@ class GridData:
 
     def to_nexus(self):
         axes = [NXfield(ax, name=n) for ax, n in zip(self.axes, self.axes_names)]
-        return NXdata(self.data, axes, name="grid_data")
+        return NXdata(array_field(self.data, "signal"), axes, name="grid_data")
 
     @staticmethod
     def from_nexus(nxdata):
@@ -165,9 +165,9 @@ class MillerIndex(GridData):
         axes = [phi, iy, ix]
         nxgroup = NXgroup(
             name="miller_index",
-            h=NXdata(self.h, axes),
-            k=NXdata(self.k, axes),
-            l=NXdata(self.l, axes),
+            h=NXdata(array_field(self.h, "signal"), axes),
+            k=NXdata(array_field(self.k, "signal"), axes),
+            l=NXdata(array_field(self.l, "signal"), axes),
         )
         return nxgroup
 
@@ -251,12 +251,12 @@ class Corrections(GridData):
         axes = [iy, ix]
         nxgroup = NXgroup(
             name="corrections",
-            solid_angle=NXdata(self.solid_angle, axes),
-            efficiency=NXdata(self.efficiency, axes),
-            attenuation=NXdata(self.attenuation, axes),
-            polarization=NXdata(self.polarization, axes),
-            inverse_lorentz=NXdata(self.inverse_lorentz, axes),
-            d3s=NXdata(self.d3s, axes),
+            solid_angle=NXdata(array_field(self.solid_angle, "signal"), axes),
+            efficiency=NXdata(array_field(self.efficiency, "signal"), axes),
+            attenuation=NXdata(array_field(self.attenuation, "signal"), axes),
+            polarization=NXdata(array_field(self.polarization, "signal"), axes),
+            inverse_lorentz=NXdata(array_field(self.inverse_lorentz, "signal"), axes),
+            d3s=NXdata(array_field(self.d3s, "signal"), axes),
         )
         return nxgroup
 
@@ -527,7 +527,7 @@ class PeakMask:
             peak_expression=self.peak_expression,
             reflection_conditions=self.reflection_conditions,
             bragg=int(self.bragg),
-            pixels=NXfield(self.pixels, name="pixels"),
+            pixels=array_field(self.pixels, "pixels"),
             shape=np.array(self.shape, dtype=np.int64),
         )
         for name in ("peak_r0", "peak_sigma", "sigma_cutoff"):
