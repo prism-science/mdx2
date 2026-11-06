@@ -1,3 +1,4 @@
+import numba as nb
 import numexpr as ne
 import numpy as np
 from nexusformat.nexus import NXdata, NXfield, NXgroup, NXsample
@@ -307,7 +308,31 @@ class Symmetry:
             local_dict={"h": h.astype(int), "k": k.astype(int), "l": l.astype(int)},
         )
 
-    def to_asu(self, h, k, l):
+    def to_asu(self, h, k, l, block=1 << 22):  # noqa: E741
+        """Map Miller indices to the asymmetric unit: (h, k, l, op) with op the index of the Laue operator used (the
+        lowest index that maps into the asymmetric unit). Rows are processed in blocks (bounded temporaries); the
+        operators are applied and the results selected in compiled loops, the asymmetric-unit test is numexpr. Same
+        result as to_asu_reference (identical for integer indices); indices that no operator maps into the asymmetric
+        unit (an inconsistent symmetry) give 0 here, uninitialized values there."""
+        h, k, l = (a if isinstance(a, np.ndarray) else np.array(a) for a in (h, k, l))  # noqa: E741
+        shape = h.shape
+        out_dtype = np.result_type(h, k, l)
+        hs, ks, ls = (np.ascontiguousarray(a).reshape(-1) for a in (h, k, l))
+        ops = np.ascontiguousarray(self.laue_group_operators, dtype=np.float64)
+        n = hs.size
+        ho, ko, lo = (np.zeros(n, dtype=out_dtype) for _ in range(3))
+        opindex = np.zeros(n, dtype=int)
+        for i0 in range(0, n, block):
+            sl = slice(i0, min(i0 + block, n))
+            hb, kb, lb = hs[sl], ks[sl], ls[sl]
+            for m in reversed(range(ops.shape[0])):
+                hn, kn, ln = _apply_laue_op(ops[m], hb, kb, lb)
+                _select_asu(self.is_asu(hn, kn, ln), hn, kn, ln, m, ho[sl], ko[sl], lo[sl], opindex[sl])
+        return ho.reshape(shape), ko.reshape(shape), lo.reshape(shape), opindex.reshape(shape)
+
+    def to_asu_reference(self, h, k, l):  # noqa: E741
+        """mdx2 <= 1.0.5 implementation of to_asu (whole-array temporaries; tensordot and masked assignment per
+        operator). Kept for tests."""
         if not isinstance(h, np.ndarray):
             h = np.array(h)
             k = np.array(k)
@@ -571,3 +596,30 @@ def load_mask(filename, name="mask"):
     if g.attrs.get("mdx2_class") == "PeakMask":
         return loadobj(filename, name)
     return StaticMask(g.signal)  # GridData: read lazily, the array may be very large
+
+
+@nb.njit(nogil=True, cache=True)
+def _apply_laue_op(op, h, k, l):  # noqa: E741
+    """Indices transformed by a Laue operator, as np.tensordot(op.T, (h, k, l), axes=1) (float64). Serial and GIL-free
+    (callers parallelize over row blocks, e.g. mdx2.correct; no numba threads inside worker processes)."""
+    n = h.size
+    hn = np.empty(n, dtype=np.float64)
+    kn = np.empty(n, dtype=np.float64)
+    ln = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        a, b, c = np.float64(h[i]), np.float64(k[i]), np.float64(l[i])
+        hn[i] = op[0, 0] * a + op[1, 0] * b + op[2, 0] * c
+        kn[i] = op[0, 1] * a + op[1, 1] * b + op[2, 1] * c
+        ln[i] = op[0, 2] * a + op[1, 2] * b + op[2, 2] * c
+    return hn, kn, ln
+
+
+@nb.njit(nogil=True, cache=True)
+def _select_asu(mask, hn, kn, ln, m, ho, ko, lo, opindex):
+    """Where mask: take the transformed indices (cast to the output dtype, as a numpy assignment) and operator m."""
+    for i in range(mask.size):
+        if mask[i]:
+            ho[i] = hn[i]
+            ko[i] = kn[i]
+            lo[i] = ln[i]
+            opindex[i] = m
