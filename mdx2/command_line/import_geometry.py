@@ -47,7 +47,7 @@ def run_import_geometry(params):
     )
     logger.info(
         "Miller index grid shape (phi, iy, ix, hkl): {}",
-        miller_index.data.shape,
+        miller_index.h.shape + (3,),  # not miller_index.data, which stacks h, k, l into a new array
     )
 
     logger.info("Computing geometric correction factors...")
