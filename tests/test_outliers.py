@@ -87,3 +87,53 @@ def test_pairs_and_singletons():
     assert S.mask_outliers(None, 5.0) == 0
     S = group([1000.0])  # nothing to compare with
     assert S.mask_outliers(None, 5.0) == 0
+
+
+def data_many_outliers(seed=1, n_groups=300):
+    """Groups of up to 40 observations, some with many spikes (several rounds needed)."""
+    rng = np.random.default_rng(seed)
+    mult = rng.integers(1, 41, n_groups)
+    ih = np.repeat(np.arange(n_groups), mult)
+    n = ih.size
+    I0 = rng.exponential(100.0, n_groups)
+    scale = rng.uniform(0.5, 1.5, n)
+    offset = rng.uniform(0, 5, n)
+    sigma = np.sqrt(scale * (I0[ih] + offset) + 4.0)
+    I = scale * (I0[ih] + offset) + sigma * rng.standard_normal(n)
+    bad = rng.random(n_groups) < 0.2  # a fifth of the groups: a third of their observations spiked
+    spikes = bad[ih] & (rng.random(n) < 0.33)
+    I[spikes] += sigma[spikes] * rng.uniform(-30.0, 30.0, spikes.sum())
+    mask = rng.random(n) < 0.03
+    return I, sigma, ih, scale, offset, mask
+
+
+@pytest.mark.parametrize("max_rounds", [1, 2, 5, 1000])
+@pytest.mark.parametrize("nthreads", [1, None])
+def test_rounds_within_groups_match_repeated_calls(max_rounds, nthreads):
+    """max_rounds rounds within each group == max_rounds calls of one round over all groups (same mask, counts);
+    capped groups are those where one more call still masks something."""
+    numba.set_num_threads(nthreads or numba.config.NUMBA_NUM_THREADS)
+    I, sigma, ih, scale, offset, mask = data_many_outliers()
+    ref = ScaledData(I, sigma, ih, scale=scale.copy(), offset=offset.copy(), mask=mask.copy())
+    high = low = rounds = 0
+    for _ in range(max_rounds):
+        if ref.mask_outliers(None, 3.0) == 0:
+            break
+        rounds += 1
+        high += ref.last_outliers["high"]
+        low += ref.last_outliers["low"]
+    S = ScaledData(I, sigma, ih, scale=scale.copy(), offset=offset.copy(), mask=mask.copy())
+    n = S.mask_outliers(None, 3.0, max_rounds=max_rounds)
+    np.testing.assert_array_equal(S.mask, ref.mask)
+    o = S.last_outliers
+    assert (o["high"], o["low"], o["rounds"], n) == (high, low, rounds, int(S.mask.sum() - mask.sum()))
+    before = ref.mask.copy()
+    ref.mask_outliers(None, 3.0)
+    np.testing.assert_array_equal(o["capped"], np.unique(ih[ref.mask & ~before]))
+    if max_rounds == 1000:
+        assert o["rounds"] > 5 and len(o["capped"]) == 0  # converged, after several rounds in some groups
+
+
+def test_max_rounds_validated():
+    with pytest.raises(ValueError, match="max_rounds"):
+        group([1.0, 2.0]).mask_outliers(None, 5.0, max_rounds=0)

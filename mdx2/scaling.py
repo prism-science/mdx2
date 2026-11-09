@@ -716,19 +716,23 @@ class ScaledData:
         )
         return out
 
-    def mask_outliers(self, Im, nsigma, method="two_sided"):
+    def mask_outliers(self, Im, nsigma, method="two_sided", max_rounds=1):
         """Mask outliers; returns how many.
 
         "two_sided": per group, the observation with the largest leave-one-out residual |r| (against the weighted
-        mean of the others, with both variances) if |r| > nsigma; both observations of a pair. At most one per group
-        per call (Im unused: sums from the current scale and offset). Counts above / below the others' mean in
-        self.last_outliers.
+        mean of the others, with both variances) if |r| > nsigma; both observations of a pair. Repeated within each
+        group until none is left or for max_rounds rounds (1: at most one per group; Im unused: sums from the current
+        scale and offset). In self.last_outliers: counts above / below the others' mean, the most rounds any group
+        needed ("rounds"), and the groups still finding outliers after max_rounds ("capped", indices).
         "legacy" (mdx2 <= 1.0.5): (scale (Im + offset) - I) / sigma > nsigma, i.e. observations below the merged
         value only, all in one pass.
         """
         if method == "two_sided":
+            if max_rounds < 1:
+                raise ValueError(f"max_rounds must be >= 1, got {max_rounds}")
             G = self._ihmax + 1
-            nhigh, nlow = np.empty(G, dtype=np.int64), np.empty(G, dtype=np.int64)
+            nhigh, nlow, nrounds = (np.empty(G, dtype=np.int64) for _ in range(3))
+            capped = np.empty(G, dtype=np.int8)
             before = self.count()
             k_outliers_loo(
                 self._gstart,
@@ -739,11 +743,20 @@ class ScaledData:
                 self.scale,
                 self.offset,
                 float(nsigma),
+                int(max_rounds),
                 nhigh,
                 nlow,
+                nrounds,
+                capped,
             )
             n = before - self.count()
-            self.last_outliers = dict(high=int(nhigh.sum()), low=int(nlow.sum()), total=n)
+            self.last_outliers = dict(
+                high=int(nhigh.sum()),
+                low=int(nlow.sum()),
+                total=n,
+                rounds=int(nrounds.max(initial=0)),
+                capped=np.flatnonzero(capped),
+            )
             return n
         if method != "legacy":
             raise ValueError(f"Unknown outlier method {method!r} (use 'two_sided' or 'legacy')")
@@ -760,7 +773,7 @@ class ScaledData:
                 self.nchunk,
             )
         )
-        self.last_outliers = dict(high=0, low=n, total=n)
+        self.last_outliers = dict(high=0, low=n, total=n, rounds=1, capped=np.empty(0, dtype=np.int64))
         return n
 
     def count(self, sl=slice(None)):

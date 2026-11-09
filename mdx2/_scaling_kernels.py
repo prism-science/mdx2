@@ -247,65 +247,77 @@ def k_split_half(gstart, order, jitter, w, flips, out):
 
 
 @nb.njit(parallel=True, cache=True, error_model="numpy")
-def k_outliers_loo(gstart, order, mask, I, sigma, scale, offset, nsigma, nhigh, nlow):
-    """Two-sided leave-one-out outlier rejection, at most one observation per group per call.
+def k_outliers_loo(gstart, order, mask, I, sigma, scale, offset, nsigma, max_rounds, nhigh, nlow, nrounds, capped):
+    """Two-sided leave-one-out outlier rejection, repeated within each group: up to max_rounds rounds per group.
 
-    Per group (unmasked observations, x = I/scale - offset, w = (scale/sigma)^2, W = sum w): the residual of
+    One round, per group (unmasked observations, x = I/scale - offset, w = (scale/sigma)^2, W = sum w): the residual of
     observation i against the weighted mean of the others, r_i = (x_i - Im_{-i}) / sqrt(1/w_i + 1/(W - w_i)), which is
     the inclusive residual (x_i - Im) sqrt(w_i) divided by sqrt(1 - w_i/W). The observation with the largest |r_i|
     is masked if |r_i| > nsigma; in a group of two (equal |r|), both are masked. Groups of one are left alone.
-    Per-group counts of masked observations above (nhigh) and below (nlow) the others' mean.
+
+    A group's residuals depend only on its own observations, so rounds are repeated within the group (sums recomputed
+    from scratch, as by repeated calls with max_rounds = 1) until it has no outlier or after max_rounds rounds: the
+    same result as max_rounds calls over all groups, with groups that are already clean tested once. Per group:
+    masked observations above (nhigh) and below (nlow) the others' mean, rounds that masked something (nrounds), and
+    capped = 1 if an outlier remains after max_rounds rounds.
     """
     G = gstart.size - 1
     for h in nb.prange(G):
         a, b = gstart[h], gstart[h + 1]
         nhigh[h] = 0
         nlow[h] = 0
-        W = 0.0
-        S = 0.0
-        m = 0
-        for t in range(a, b):
-            i = order[t]
-            if not mask[i]:
-                sc = scale[i]
-                sp = np.float64(sigma[i]) / sc
-                wi = 1.0 / (sp * sp)
-                W += wi
-                S += wi * (np.float64(I[i]) / sc - offset[i])
-                m += 1
-        if m < 2:
-            continue
-        worst = -1
-        rmax = 0.0
-        rsign = 0.0
-        for t in range(a, b):
-            i = order[t]
-            if mask[i]:
-                continue
-            sc = scale[i]
-            sp = np.float64(sigma[i]) / sc
-            wi = 1.0 / (sp * sp)
-            xi = np.float64(I[i]) / sc - offset[i]
-            Wr = W - wi
-            if not (Wr > 0.0):
-                continue
-            r = (xi - (S - wi * xi) / Wr) / math.sqrt(sp * sp + 1.0 / Wr)
-            if abs(r) > rmax:
-                rmax = abs(r)
-                rsign = r
-                worst = i
-        if worst < 0 or not (rmax > nsigma):
-            continue
-        if m == 2:  # the two residuals are equal and opposite: no way to tell which is wrong
+        nrounds[h] = 0
+        capped[h] = 0
+        for rnd in range(max_rounds + 1):
+            W = 0.0
+            S = 0.0
+            m = 0
             for t in range(a, b):
                 i = order[t]
                 if not mask[i]:
-                    mask[i] = True
-            nhigh[h] = 1
-            nlow[h] = 1
-        else:
+                    sc = scale[i]
+                    sp = np.float64(sigma[i]) / sc
+                    wi = 1.0 / (sp * sp)
+                    W += wi
+                    S += wi * (np.float64(I[i]) / sc - offset[i])
+                    m += 1
+            if m < 2:
+                break
+            worst = -1
+            rmax = 0.0
+            rsign = 0.0
+            for t in range(a, b):
+                i = order[t]
+                if mask[i]:
+                    continue
+                sc = scale[i]
+                sp = np.float64(sigma[i]) / sc
+                wi = 1.0 / (sp * sp)
+                xi = np.float64(I[i]) / sc - offset[i]
+                Wr = W - wi
+                if not (Wr > 0.0):
+                    continue
+                r = (xi - (S - wi * xi) / Wr) / math.sqrt(sp * sp + 1.0 / Wr)
+                if abs(r) > rmax:
+                    rmax = abs(r)
+                    rsign = r
+                    worst = i
+            if worst < 0 or not (rmax > nsigma):
+                break
+            if rnd == max_rounds:  # an outlier remains: stop here
+                capped[h] = 1
+                break
+            nrounds[h] += 1
+            if m == 2:  # the two residuals are equal and opposite: no way to tell which is wrong
+                for t in range(a, b):
+                    i = order[t]
+                    if not mask[i]:
+                        mask[i] = True
+                nhigh[h] += 1
+                nlow[h] += 1
+                break
             mask[worst] = True
             if rsign > 0:
-                nhigh[h] = 1
+                nhigh[h] += 1
             else:
-                nlow[h] = 1
+                nlow[h] += 1
