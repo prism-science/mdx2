@@ -60,7 +60,7 @@ class Parameters:
             )
 
 
-MAX_OUTLIER_ROUNDS = 100  # safety cap for two-sided rejection (insulin: 7 rounds at 5 sigma, 13 at 3 sigma)
+MAX_OUTLIER_ROUNDS = 100  # per-group cap for two-sided rejection (insulin: 7 rounds at 5 sigma, 13 at 3 sigma)
 
 # note: negative_prefix is used to allow --no-scaling, --no-offset, etc. for consistency with old argparse api
 # future: could switch split to an Enum type, to simplify selection of choices by alternate APIs
@@ -122,27 +122,25 @@ def run_merge(params):
                 nout = S.mask_outliers(Im, params.outlier, method="legacy")
                 logger.info("Removed {} outliers (>{} sigma)", nout, params.outlier)
             else:
-                nout = high = low = rounds = 0
-                while True:  # at most one per group per round
-                    if rounds == MAX_OUTLIER_ROUNDS:
-                        logger.warning(
-                            "Outlier rejection stopped after {} rounds (still finding outliers)", MAX_OUTLIER_ROUNDS
-                        )
-                        break
-                    n = S.mask_outliers(None, params.outlier)
-                    if n == 0:
-                        break
-                    rounds += 1
-                    nout += n
-                    high += S.last_outliers["high"]
-                    low += S.last_outliers["low"]
+                # rounds repeat within each group (one pass over the data), up to MAX_OUTLIER_ROUNDS per group
+                nout = S.mask_outliers(None, params.outlier, max_rounds=MAX_OUTLIER_ROUNDS)
+                o = S.last_outliers
+                if len(o["capped"]):
+                    worst = ", ".join(f"({h[g]:g}, {k[g]:g}, {l[g]:g})" for g in o["capped"][:5])
+                    logger.warning(
+                        "Outlier rejection stopped after {} rounds in {} group(s), still finding outliers: {}{}",
+                        MAX_OUTLIER_ROUNDS,
+                        len(o["capped"]),
+                        worst,
+                        ", ..." if len(o["capped"]) > 5 else "",
+                    )
                 logger.info(
                     "Removed {} outliers (|leave-one-out residual| >{} sigma; {} high, {} low; {} round(s))",
                     nout,
                     params.outlier,
-                    high,
-                    low,
-                    rounds,
+                    o["high"],
+                    o["low"],
+                    o["rounds"],
                 )
         logger.info("Merging again...")
         with P.step("merge"):
